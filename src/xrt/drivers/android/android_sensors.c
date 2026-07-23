@@ -152,11 +152,16 @@ android_sensor_callback(ASensorEvent *event, struct android_device *d)
 
 	switch (event->type) {
 	case ASENSOR_TYPE_ACCELEROMETER: {
-		accel.x = event->acceleration.y;
-		accel.y = -event->acceleration.x;
+		// Same permutation as the gyro below; a mirrored accel frame makes gravity correction fight the gyro.
+		accel.x = -event->acceleration.y;
+		accel.y = event->acceleration.x;
 		accel.z = event->acceleration.z;
 
 		ANDROID_TRACE(d, "accel %" PRId64 " %.2f %.2f %.2f", event->timestamp, accel.x, accel.y, accel.z);
+
+		os_mutex_lock(&d->lock);
+		d->last_accel = accel;
+		os_mutex_unlock(&d->lock);
 		break;
 	}
 	case ASENSOR_TYPE_GYROSCOPE: {
@@ -166,13 +171,10 @@ android_sensor_callback(ASensorEvent *event, struct android_device *d)
 
 		ANDROID_TRACE(d, "gyro %" PRId64 " %.2f %.2f %.2f", event->timestamp, gyro.x, gyro.y, gyro.z);
 
-		// TODO: Make filter handle accelerometer
-		struct xrt_vec3 null_accel = XRT_VEC3_ZERO;
-
-		// Lock last and the fusion.
+		// Lock last_accel and the fusion.
 		os_mutex_lock(&d->lock);
 
-		m_imu_3dof_update(&d->fusion, event->timestamp, &null_accel, &gyro);
+		m_imu_3dof_update(&d->fusion, event->timestamp, &d->last_accel, &gyro);
 
 		// Now done.
 		os_mutex_unlock(&d->lock);

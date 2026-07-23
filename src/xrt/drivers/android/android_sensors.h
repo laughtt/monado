@@ -38,9 +38,11 @@ struct android_device
 
 	struct
 	{
-		//! Lock for last and fusion.
+		//! Lock for last_accel and fusion.
 		struct os_mutex lock;
 		struct m_imu_3dof fusion;
+		//! Latest accelerometer sample, fed to the fusion on each gyro update.
+		struct xrt_vec3 last_accel;
 	};
 
 	enum u_logging_level log_level;
