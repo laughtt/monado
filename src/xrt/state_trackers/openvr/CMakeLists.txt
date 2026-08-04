@@ -17,6 +17,8 @@ add_library(
 	common/openvr_math.hpp
 	compositor/openvr_compositor.cpp
 	compositor/openvr_compositor.hpp
+	interfaces/XRTVRApplications.cpp
+	interfaces/XRTVRApplications.hpp
 	interfaces/XRTVRChaperone.cpp
 	interfaces/XRTVRChaperone.hpp
 	interfaces/XRTVRChaperoneSetup.cpp
@@ -25,10 +27,42 @@ add_library(
 	interfaces/XRTVRClientCore.hpp
 	interfaces/XRTVRCompositor.cpp
 	interfaces/XRTVRCompositor.hpp
+	interfaces/XRTVRControlPanel.cpp
+	interfaces/XRTVRControlPanel.hpp
+	interfaces/XRTVRDebug.cpp
+	interfaces/XRTVRDebug.hpp
+	interfaces/XRTVRDriverManager.cpp
+	interfaces/XRTVRDriverManager.hpp
+	interfaces/XRTVRExtendedDisplay.cpp
+	interfaces/XRTVRExtendedDisplay.hpp
+	interfaces/XRTVRHeadsetView.cpp
+	interfaces/XRTVRHeadsetView.hpp
+	interfaces/XRTVRIOBuffer.cpp
+	interfaces/XRTVRIOBuffer.hpp
+	interfaces/XRTVRIPCResourceManagerClient.cpp
+	interfaces/XRTVRIPCResourceManagerClient.hpp
+	interfaces/XRTVRInput.cpp
+	interfaces/XRTVRInput.hpp
+	interfaces/XRTVRNotifications.cpp
+	interfaces/XRTVRNotifications.hpp
+	interfaces/XRTVROverlay.cpp
+	interfaces/XRTVROverlay.hpp
+	interfaces/XRTVROverlayView.cpp
+	interfaces/XRTVROverlayView.hpp
 	interfaces/XRTVRRenderModels.cpp
 	interfaces/XRTVRRenderModels.hpp
+	interfaces/XRTVRResources.cpp
+	interfaces/XRTVRResources.hpp
+	interfaces/XRTVRScreenshots.cpp
+	interfaces/XRTVRScreenshots.hpp
+	interfaces/XRTVRSettings.cpp
+	interfaces/XRTVRSettings.hpp
+	interfaces/XRTVRSpatialAnchors.cpp
+	interfaces/XRTVRSpatialAnchors.hpp
 	interfaces/XRTVRSystem.cpp
 	interfaces/XRTVRSystem.hpp
+	interfaces/XRTVRTrackedCamera.cpp
+	interfaces/XRTVRTrackedCamera.hpp
 	interfaces/old/XRTVRChaperone_003.hpp
 	interfaces/old/XRTVRChaperoneSetup_005.hpp
 	interfaces/old/XRTVRCompositor_022.hpp

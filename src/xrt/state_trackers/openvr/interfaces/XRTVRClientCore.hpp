@@ -41,7 +41,27 @@ namespace xrt::state_trackers::openvr {
 	_(VRSystem, _023)                                                                                              \
 	_(VRSystem, _026)                                                                                              \
 	_(VRCompositor, _022)                                                                                          \
-	_(VRCompositor, _024) _(VRCompositor, _026) _(VRCompositor, _027) _(VRCompositor, _028) _(VRCompositor, _029)
+	_(VRCompositor, _024)                                                                                          \
+	_(VRCompositor, _026)                                                                                          \
+	_(VRCompositor, _027)                                                                                          \
+	_(VRCompositor, _028)                                                                                          \
+	_(VRCompositor, _029)                                                                                          \
+	_(VRApplications, _008)                                                                                        \
+	_(VRControlPanel, _001)                                                                                        \
+	_(VRDebug, _001)                                                                                               \
+	_(VRDriverManager, _001)                                                                                       \
+	_(VRExtendedDisplay, _001)                                                                                     \
+	_(VRHeadsetView, _001)                                                                                         \
+	_(VRInput, _011)                                                                                               \
+	_(VRIOBuffer, _002)                                                                                            \
+	_(VRNotifications, _002)                                                                                       \
+	_(VROverlay, _028)                                                                                             \
+	_(VROverlayView, _003)                                                                                         \
+	_(VRResources, _001)                                                                                           \
+	_(VRScreenshots, _001)                                                                                         \
+	_(VRSettings, _003)                                                                                            \
+	_(VRSpatialAnchors, _001)                                                                                      \
+	_(VRTrackedCamera, _006)
 
 class XRTVRClientCore_003 : public vr::IVRClientCore_003
 {
