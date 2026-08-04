@@ -524,6 +524,7 @@ Compositor::transferAppImageToSwapchainImage(openvr_logger &logger,
                                              xrt_swapchain *xsc,
                                              uint32_t dst_index,
                                              vr::VRVulkanTextureData_t &texture_data,
+                                             uint32_t src_array_index,
                                              VkFormat storage_format,
                                              vr::EColorSpace color_space,
                                              const xrt_rect &rect)
@@ -592,7 +593,7 @@ Compositor::transferAppImageToSwapchainImage(openvr_logger &logger,
 	                },
 	            .fm_image =
 	                {
-	                    .base_array_layer = 0,
+	                    .base_array_layer = src_array_index,
 	                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
 	                    .image = src_image,
 	                },
@@ -808,6 +809,7 @@ vr::EVRCompositorError
 Compositor::submitVulkan(openvr_logger &logger,
                          vr::EVREye eye,
                          vr::VRVulkanTextureData_t &texture_data,
+                         uint32_t array_index,
                          vr::EColorSpace color_space,
                          const vr::VRTextureBounds_t &bounds)
 {
@@ -903,7 +905,7 @@ Compositor::submitVulkan(openvr_logger &logger,
 	}
 
 	// Copy the app texture into the swapchain image
-	xret = transferAppImageToSwapchainImage(logger, xsc, image_index, texture_data, storage_format,
+	xret = transferAppImageToSwapchainImage(logger, xsc, image_index, texture_data, array_index, storage_format,
 	                                        resolved_color_space, source_rect);
 	if (xret != XRT_SUCCESS) {
 		OPENVR_LOG_ERROR_XRET(logger, "Failed to blit app image to swapchain image", xret);

@@ -207,6 +207,7 @@ vr::EVRCompositorError
 Compositor::submit(openvr_logger &logger,
                    vr::EVREye eye,
                    const vr::Texture_t &texture,
+                   uint32_t array_index,
                    const vr::VRTextureBounds_t &bounds,
                    vr::EVRSubmitFlags nSubmitFlags)
 {
@@ -215,13 +216,14 @@ Compositor::submit(openvr_logger &logger,
 	// @todo return SharedTexturesNotSupported when the app doesn't use CreateDXGIFactory1 or later
 	// @todo return TextureUsesUnsupportedFormat when the app uses a DXGI non-sharable format
 
+	// SteamVR returns InvalidTexture first
+	if (texture.handle == nullptr) {
+		return vr::EVRCompositorError::VRCompositorError_InvalidTexture;
+	}
+
 	// We don't have a compositor eg. we're not a scene application.
 	if (this->xsysc == nullptr) {
 		return vr::EVRCompositorError::VRCompositorError_IsNotSceneApplication;
-	}
-
-	if (texture.handle == nullptr) {
-		return vr::EVRCompositorError::VRCompositorError_InvalidTexture;
 	}
 
 	// Eye has already been submit
@@ -235,7 +237,7 @@ Compositor::submit(openvr_logger &logger,
 	case vr::ETextureType::TextureType_Vulkan: {
 		// Supported.
 		auto error = this->submitVulkan(logger, eye, *static_cast<vr::VRVulkanTextureData_t *>(texture.handle),
-		                                texture.eColorSpace, bounds);
+		                                array_index, texture.eColorSpace, bounds);
 
 		if (error != vr::EVRCompositorError::VRCompositorError_None) {
 			return error;

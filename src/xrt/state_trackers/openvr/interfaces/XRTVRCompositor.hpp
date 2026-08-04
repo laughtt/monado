@@ -70,6 +70,7 @@ public:
 	       const vr::Texture_t *pTexture,
 	       const vr::VRTextureBounds_t *pBounds = 0,
 	       vr::EVRSubmitFlags nSubmitFlags = vr::Submit_Default) override;
+
 	vr::EVRCompositorError
 	SubmitWithArrayIndex(vr::EVREye eEye,
 	                     const vr::Texture_t *pTexture,

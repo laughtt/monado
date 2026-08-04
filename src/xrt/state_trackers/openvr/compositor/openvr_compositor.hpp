@@ -209,6 +209,7 @@ private: // Methods
 	                                 xrt_swapchain *xsc,
 	                                 uint32_t dst_index,
 	                                 vr::VRVulkanTextureData_t &texture_data,
+									 uint32_t src_array_index,
 	                                 VkFormat storage_format,
 	                                 vr::EColorSpace color_space,
 	                                 const xrt_rect &rect);
@@ -218,6 +219,7 @@ private: // Methods
 	submitVulkan(openvr_logger &logger,
 	             vr::EVREye eye,
 	             vr::VRVulkanTextureData_t &texture_data,
+				 uint32_t array_index,
 	             vr::EColorSpace color_space,
 	             const vr::VRTextureBounds_t &bounds);
 
@@ -253,6 +255,7 @@ public: // Methods
 	submit(openvr_logger &logger,
 	       vr::EVREye eye,
 	       const vr::Texture_t &texture,
+	       uint32_t array_index,
 	       const vr::VRTextureBounds_t &bounds,
 	       vr::EVRSubmitFlags nSubmitFlags);
 

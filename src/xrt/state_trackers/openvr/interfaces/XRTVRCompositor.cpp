@@ -148,16 +148,7 @@ XRTVRCompositor_029::Submit(vr::EVREye eEye,
 	openvr_logger logger;
 	OPENVR_LOGGER_INIT(logger);
 
-	if (pTexture == nullptr) {
-		return vr::EVRCompositorError::VRCompositorError_InvalidTexture;
-	}
-
-	vr::VRTextureBounds_t default_bounds = {.uMin = 0.0f, .vMin = 0.0f, .uMax = 1.0f, .vMax = 1.0f};
-	if (pBounds == nullptr) {
-		pBounds = &default_bounds;
-	}
-
-	return this->core->compositor->submit(logger, eEye, *pTexture, *pBounds, nSubmitFlags);
+	return this->SubmitWithArrayIndex(eEye, pTexture, 0, pBounds, nSubmitFlags);
 }
 
 vr::EVRCompositorError
@@ -170,13 +161,21 @@ XRTVRCompositor_029::SubmitWithArrayIndex(vr::EVREye eEye,
 	openvr_logger logger;
 	OPENVR_LOGGER_INIT(logger);
 
-	OPENVR_LOG_UNIMPLEMENTED_RET(
-	    logger,
-	    "SubmitWithArrayIndex(eEye=%d, pTexture=%p, unTextureArrayIndex=%u, pBounds=%p, nSubmitFlags=%u) -> %d",
-	    vr::EVRCompositorError::VRCompositorError_RequestFailed, static_cast<int>(eEye),
-	    static_cast<const void *>(pTexture), static_cast<unsigned int>(unTextureArrayIndex),
-	    static_cast<const void *>(pBounds), static_cast<unsigned int>(nSubmitFlags),
-	    static_cast<int>(vr::EVRCompositorError::VRCompositorError_RequestFailed));
+	if (pTexture == nullptr) {
+		return vr::EVRCompositorError::VRCompositorError_InvalidTexture;
+	}
+
+	vr::VRTextureBounds_t default_bounds = {.uMin = 0.0f, .vMin = 0.0f, .uMax = 1.0f, .vMax = 1.0f};
+	if (pBounds == nullptr) {
+		pBounds = &default_bounds;
+	}
+
+	return this->core->compositor->submit(logger,              //
+	                                      eEye,                //
+	                                      *pTexture,           //
+	                                      unTextureArrayIndex, //
+	                                      *pBounds,            //
+	                                      nSubmitFlags);       //
 }
 
 void
