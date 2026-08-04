@@ -192,14 +192,26 @@ XRTVRSystem_026::ComputeDistortionSet(vr::EVREye eEye,
 	openvr_logger logger;
 	OPENVR_LOGGER_INIT(logger);
 
-	std::memset(pOutput, 0, sizeof(*pOutput) * nNumCoordinates);
-	OPENVR_LOG_UNIMPLEMENTED_RET(
-	    logger,
-	    "ComputeDistortionSet(eEye=%d, eChannel=%d, bAsNormalizedDeviceCoordinates=%d, nNumCoordinates=%u, "
-	    "pInput=%p, pOutput=%p) -> %d",
-	    false, static_cast<int>(eEye), static_cast<int>(eChannel), static_cast<int>(bAsNormalizedDeviceCoordinates),
-	    static_cast<unsigned int>(nNumCoordinates), static_cast<const void *>(pInput), static_cast<void *>(pOutput),
-	    0);
+	if (nNumCoordinates == 0) {
+		return true;
+	}
+
+	// @note: SteamVR does not check for nullptr for either of these, and segfaults if they're null.
+	if (pInput == nullptr) {
+		OPENVR_LOG_ERROR(logger, "ComputeDistortionSet: pInput == nullptr");
+		return false;
+	}
+
+	if (pOutput == nullptr) {
+		OPENVR_LOG_ERROR(logger, "ComputeDistortionSet: pOutput == nullptr");
+		return false;
+	}
+
+	for (uint32_t i = 0; i < nNumCoordinates; i++) {
+		(*pOutput) = *pInput;
+	}
+
+	return true;
 }
 
 vr::HmdMatrix34_t
@@ -355,6 +367,7 @@ XRTVRSystem_026::GetSortedTrackedDeviceIndicesOfClass(vr::ETrackedDeviceClass eT
 
 	std::memset(punTrackedDeviceIndexArray, 0,
 	            sizeof(*punTrackedDeviceIndexArray) * unTrackedDeviceIndexArrayCount);
+
 	OPENVR_LOG_UNIMPLEMENTED_RET(
 	    logger,
 	    "GetSortedTrackedDeviceIndicesOfClass(eTrackedDeviceClass=%d, punTrackedDeviceIndexArray=%p, "

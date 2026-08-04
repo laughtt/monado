@@ -105,6 +105,10 @@ XRTVRRenderModels_006::GetRenderModelName(uint32_t unRenderModelIndex,
 	openvr_logger logger;
 	OPENVR_LOGGER_INIT(logger);
 
+	if (pchRenderModelName == nullptr) {
+		return 0;
+	}
+
 	if (unRenderModelNameLen > 0) {
 		pchRenderModelName[0] = '\0';
 	}
