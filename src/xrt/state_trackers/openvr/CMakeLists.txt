@@ -63,17 +63,17 @@ add_library(
 	interfaces/XRTVRSystem.hpp
 	interfaces/XRTVRTrackedCamera.cpp
 	interfaces/XRTVRTrackedCamera.hpp
-	interfaces/old/XRTVRChaperone_003.hpp
-	interfaces/old/XRTVRChaperoneSetup_005.hpp
-	interfaces/old/XRTVRCompositor_022.hpp
-	interfaces/old/XRTVRCompositor_024.hpp
-	interfaces/old/XRTVRCompositor_026.hpp
-	interfaces/old/XRTVRCompositor_027.hpp
-	interfaces/old/XRTVRCompositor_028.hpp
-	interfaces/old/XRTVRSystem_019.hpp
-	interfaces/old/XRTVRSystem_020.hpp
-	interfaces/old/XRTVRSystem_021.hpp
-	interfaces/old/XRTVRSystem_023.hpp
+	interfaces/old/IVRChaperone/XRTVRChaperone_003.hpp
+	interfaces/old/IVRChaperoneSetup/XRTVRChaperoneSetup_005.hpp
+	interfaces/old/IVRCompositor/XRTVRCompositor_022.hpp
+	interfaces/old/IVRCompositor/XRTVRCompositor_024.hpp
+	interfaces/old/IVRCompositor/XRTVRCompositor_026.hpp
+	interfaces/old/IVRCompositor/XRTVRCompositor_027.hpp
+	interfaces/old/IVRCompositor/XRTVRCompositor_028.hpp
+	interfaces/old/IVRSystem/XRTVRSystem_019.hpp
+	interfaces/old/IVRSystem/XRTVRSystem_020.hpp
+	interfaces/old/IVRSystem/XRTVRSystem_021.hpp
+	interfaces/old/IVRSystem/XRTVRSystem_023.hpp
 	)
 
 if(XRT_HAVE_VULKAN)

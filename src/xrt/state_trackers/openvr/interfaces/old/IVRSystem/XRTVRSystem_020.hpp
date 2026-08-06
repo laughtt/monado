@@ -16,7 +16,8 @@
 #include "openvr_forward_macros.h"
 
 #include "interfaces/XRTVRSystem.hpp"
-#include "interfaces/old/XRTVRSystem_021.hpp"
+
+#include "XRTVRSystem_021.hpp"
 
 
 namespace xrt::state_trackers::openvr {
