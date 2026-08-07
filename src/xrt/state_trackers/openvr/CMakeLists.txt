@@ -9,6 +9,8 @@ add_library(
 	openvr_events.cpp
 	openvr_events.hpp
 	openvr_negotiate.cpp
+	openvr_input.cpp
+	openvr_input.hpp
 	common/openvr_error.cpp
 	common/openvr_error.hpp
 	common/openvr_logger.cpp

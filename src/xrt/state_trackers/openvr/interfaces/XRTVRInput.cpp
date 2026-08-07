@@ -39,10 +39,18 @@ XRTVRInput_011::GetActionSetHandle(const char *pchActionSetName, VRActionSetHand
 	openvr_logger logger;
 	OPENVR_LOGGER_INIT(logger);
 
-	OPENVR_LOG_UNIMPLEMENTED_RET(
-	    logger, "GetActionSetHandle(pchActionSetName=%s, pHandle=%p) -> %llu", static_cast<EVRInputError>(0),
-	    pchActionSetName != nullptr ? pchActionSetName : "(null)", static_cast<void *>(pHandle),
-	    static_cast<unsigned long long>(static_cast<EVRInputError>(0)));
+	if (pchActionSetName == nullptr || pHandle == nullptr) {
+		return vr::EVRInputError::VRInputError_InvalidParam;
+	}
+
+	std::string name(pchActionSetName);
+
+	auto ret = this->core->input->getActionSetHandle(name, *pHandle);
+
+	OPENVR_LOG_TRACE(logger, "GetActionSetHandle(pchActionSetName=%s, pHandle=%p) -> %llu", pchActionSetName,
+	                 static_cast<void *>(pHandle), static_cast<unsigned long long>(*pHandle));
+
+	return ret;
 }
 
 EVRInputError
@@ -51,10 +59,18 @@ XRTVRInput_011::GetActionHandle(const char *pchActionName, VRActionHandle_t *pHa
 	openvr_logger logger;
 	OPENVR_LOGGER_INIT(logger);
 
-	OPENVR_LOG_UNIMPLEMENTED_RET(logger, "GetActionHandle(pchActionName=%s, pHandle=%p) -> %llu",
-	                             static_cast<EVRInputError>(0), pchActionName != nullptr ? pchActionName : "(null)",
-	                             static_cast<void *>(pHandle),
-	                             static_cast<unsigned long long>(static_cast<EVRInputError>(0)));
+	if (pchActionName == nullptr || pHandle == nullptr) {
+		return vr::EVRInputError::VRInputError_InvalidParam;
+	}
+
+	std::string name(pchActionName);
+
+	auto ret = this->core->input->getActionHandle(name, *pHandle);
+
+	OPENVR_LOG_TRACE(logger, "GetActionHandle(pchActionName=%s, pHandle=%p) -> %llu", pchActionName,
+	                 static_cast<void *>(pHandle), static_cast<unsigned long long>(*pHandle));
+
+	return ret;
 }
 
 EVRInputError
@@ -63,10 +79,18 @@ XRTVRInput_011::GetInputSourceHandle(const char *pchInputSourcePath, VRInputValu
 	openvr_logger logger;
 	OPENVR_LOGGER_INIT(logger);
 
-	OPENVR_LOG_UNIMPLEMENTED_RET(
-	    logger, "GetInputSourceHandle(pchInputSourcePath=%s, pHandle=%p) -> %llu", static_cast<EVRInputError>(0),
-	    pchInputSourcePath != nullptr ? pchInputSourcePath : "(null)", static_cast<void *>(pHandle),
-	    static_cast<unsigned long long>(static_cast<EVRInputError>(0)));
+	if (pchInputSourcePath == nullptr || pHandle == nullptr) {
+		return vr::EVRInputError::VRInputError_InvalidParam;
+	}
+
+	std::string path(pchInputSourcePath);
+
+	auto ret = this->core->input->getInputSourceHandle(path, *pHandle);
+
+	OPENVR_LOG_TRACE(logger, "GetInputSourceHandle(pchInputSourcePath=%s, pHandle=%p) -> %llu", pchInputSourcePath,
+	                 static_cast<void *>(pHandle), static_cast<unsigned long long>(*pHandle));
+
+	return ret;
 }
 
 EVRInputError
@@ -181,9 +205,18 @@ XRTVRInput_011::GetDominantHand(ETrackedControllerRole *peDominantHand)
 	openvr_logger logger;
 	OPENVR_LOGGER_INIT(logger);
 
-	OPENVR_LOG_UNIMPLEMENTED_RET(logger, "GetDominantHand(peDominantHand=%p) -> %llu",
-	                             static_cast<EVRInputError>(0), static_cast<void *>(peDominantHand),
-	                             static_cast<unsigned long long>(static_cast<EVRInputError>(0)));
+	// @todo verify this is the right error
+	if (peDominantHand == nullptr) {
+		OPENVR_LOG_TRACE(logger, "GetDominantHand(peDominantHand=nullptr) -> VRInputError_InvalidParam");
+		return EVRInputError::VRInputError_InvalidParam;
+	}
+
+	auto ret = this->core->input->getDominantHand(*peDominantHand);
+
+	OPENVR_LOG_TRACE(logger, "GetDominantHand(peDominantHand=%d) -> %d", static_cast<int>(*peDominantHand),
+	                 static_cast<int>(ret));
+
+	return ret;
 }
 
 EVRInputError
@@ -192,9 +225,12 @@ XRTVRInput_011::SetDominantHand(ETrackedControllerRole eDominantHand)
 	openvr_logger logger;
 	OPENVR_LOGGER_INIT(logger);
 
-	OPENVR_LOG_UNIMPLEMENTED_RET(logger, "SetDominantHand(eDominantHand=%llu) -> %llu",
-	                             static_cast<EVRInputError>(0), static_cast<unsigned long long>(eDominantHand),
-	                             static_cast<unsigned long long>(static_cast<EVRInputError>(0)));
+	auto ret = this->core->input->setDominantHand(eDominantHand);
+
+	OPENVR_LOG_TRACE(logger, "SetDominantHand(eDominantHand=%d) -> %d", static_cast<int>(eDominantHand),
+	                 static_cast<int>(ret));
+
+	return ret;
 }
 
 EVRInputError

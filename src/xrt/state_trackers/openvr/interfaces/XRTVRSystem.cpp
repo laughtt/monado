@@ -555,6 +555,8 @@ XRTVRSystem_026::GetStringTrackedDeviceProperty(vr::TrackedDeviceIndex_t unDevic
 	openvr_logger logger;
 	OPENVR_LOGGER_INIT(logger);
 
+	OPENVR_LOG_TRACE(logger, "GetStringTrackedDeviceProperty(%d)", static_cast<int>(prop));
+
 	std::string str;
 	if (!this->core->devices->getDeviceStringProperty(logger, unDeviceIndex, prop, str, pError)) {
 		return 0;

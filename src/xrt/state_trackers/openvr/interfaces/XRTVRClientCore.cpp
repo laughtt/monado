@@ -141,6 +141,7 @@ XRTVRClientCore_003::Init(vr::EVRApplicationType eApplicationType, const char *p
 	this->events = std::make_shared<Events>(this->xs);
 	this->compositor = std::make_shared<Compositor>(this->xsysd, this->xcn, this->xsysc, this->events);
 	this->devices = std::make_shared<Devices>(logger, this->xso, this->xsysd, this->events);
+	this->input = std::make_shared<Input>();
 
 	return vr::EVRInitError::VRInitError_None;
 }

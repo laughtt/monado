@@ -15,6 +15,9 @@
 
 #include "XRTVRClientCore.hpp"
 
+#include <string>
+#include <unordered_map>
+
 
 namespace xrt::state_trackers::openvr {
 

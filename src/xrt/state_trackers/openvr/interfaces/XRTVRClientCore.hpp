@@ -17,6 +17,7 @@
 
 #include "openvr_devices.hpp"
 #include "openvr_events.hpp"
+#include "openvr_input.hpp"
 
 #include "compositor/openvr_compositor.hpp"
 
@@ -165,6 +166,7 @@ public: // Fields
 	std::shared_ptr<Compositor> compositor{};
 	std::shared_ptr<Devices> devices{};
 	std::shared_ptr<Events> events{};
+	std::shared_ptr<Input> input{};
 
 	vr::EVRApplicationType application_type{};
 
