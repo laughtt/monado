@@ -218,8 +218,23 @@ Devices::getDeviceStringProperty(openvr_logger &logger,
 	xrt_device *xdev = device->xdev;
 
 	switch (prop) {
-	case vr::ETrackedDeviceProperty::Prop_TrackingSystemName_String: str = xdev->tracking_origin->name; break;
+	case vr::ETrackedDeviceProperty::Prop_TrackingSystemName_String:
+		// @todo hardcode this based on xdev->name
+		str = xdev->tracking_origin->name;
+		break;
 	case vr::ETrackedDeviceProperty::Prop_SerialNumber_String: str = xdev->serial; break;
+	case vr::ETrackedDeviceProperty::Prop_ModelNumber_String:
+		// @todo hardcode this based on xdev->name
+		str = xdev->str;
+		break;
+	case vr::ETrackedDeviceProperty::Prop_ManufacturerName_String:
+		// @todo hardcode this based on xdev->name
+		str = "Monado";
+		break;
+	case vr::ETrackedDeviceProperty::Prop_RenderModelName_String:
+		// @todo hardcode this based on xdev->name
+		str = "TODO";
+		break;
 	default: SET_ERROR(pError, vr::ETrackedPropertyError::TrackedProp_UnknownProperty); return false;
 	}
 
