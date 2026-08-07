@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief Implementation of the IVRSystem interface version 023.
+ * @brief Implementation of the IVRSystem interface version 019.
  *
  * @author Beyley Cardellio <ep1cm1n10n123@gmail.com>
  * @ingroup openvr_interfaces
@@ -10,9 +10,12 @@
 
 #pragma once
 
+#include "common/openvr_logger.hpp"
+
 #include "openvr_interfaces_unified.h"
 #include "openvr_forward_macros.h"
 
+#include "interfaces/XRTVRSystem.hpp"
 #include "XRTVRSystem_020.hpp"
 
 
@@ -64,7 +67,6 @@ public:
 	Forward_IVRSystem_GetPropErrorNameFromEnum_026();
 	Forward_IVRSystem_PollNextEvent_026();
 	Forward_IVRSystem_PollNextEventWithPose_026();
-	Forward_IVRSystem_PollNextEventWithPoseAndOverlays();
 	Forward_IVRSystem_GetEventTypeNameFromEnum();
 	Forward_IVRSystem_GetHiddenAreaMesh_026();
 	Forward_IVRSystem_GetControllerState_026();
@@ -85,12 +87,13 @@ public:
 	{
 		openvr_logger logger;
 		OPENVR_LOGGER_INIT(logger);
+
 		OPENVR_LOG_UNIMPLEMENTED_RET(logger,
-		                             "DriverDebugRequest(unDeviceIndex=%u, pchRequest=%s, "
-		                             "pchResponseBuffer=%p, unResponseBufferSize=%u) -> %u",
-		                             0U, static_cast<unsigned int>(unDeviceIndex), pchRequest,
+		                             "DriverDebugRequest(unDeviceIndex=%llu, pchRequest=%s, "
+		                             "pchResponseBuffer=%p, unResponseBufferSize=%llu) -> 0",
+		                             0, static_cast<unsigned long long>(unDeviceIndex), pchRequest,
 		                             static_cast<void *>(pchResponseBuffer),
-		                             static_cast<unsigned int>(unResponseBufferSize), 0U);
+		                             static_cast<unsigned long long>(unResponseBufferSize));
 	}
 
 	Forward_IVRSystem_PerformFirmwareUpdate_026();

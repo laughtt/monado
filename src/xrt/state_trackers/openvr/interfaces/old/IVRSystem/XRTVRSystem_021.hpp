@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief Implementation of the IVRSystem interface version 023.
+ * @brief Implementation of the IVRSystem interface version 021.
  *
  * @author Beyley Cardellio <ep1cm1n10n123@gmail.com>
  * @ingroup openvr_interfaces
@@ -50,7 +50,6 @@ public:
 	void
 	ResetSeatedZeroPose() override
 	{
-		// @todo Implement this method. For now, just log that it was called.
 		openvr_logger logger;
 		OPENVR_LOGGER_INIT(logger);
 
@@ -76,7 +75,6 @@ public:
 	Forward_IVRSystem_GetPropErrorNameFromEnum_026();
 	Forward_IVRSystem_PollNextEvent_026();
 	Forward_IVRSystem_PollNextEventWithPose_026();
-	Forward_IVRSystem_PollNextEventWithPoseAndOverlays();
 	Forward_IVRSystem_GetEventTypeNameFromEnum();
 	Forward_IVRSystem_GetHiddenAreaMesh_026();
 	Forward_IVRSystem_GetControllerState_026();

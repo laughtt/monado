@@ -16,7 +16,6 @@
 #include "openvr_forward_macros.h"
 
 #include "interfaces/XRTVRSystem.hpp"
-
 #include "XRTVRSystem_021.hpp"
 
 
@@ -68,7 +67,6 @@ public:
 	Forward_IVRSystem_GetPropErrorNameFromEnum_026();
 	Forward_IVRSystem_PollNextEvent_026();
 	Forward_IVRSystem_PollNextEventWithPose_026();
-	Forward_IVRSystem_PollNextEventWithPoseAndOverlays();
 	Forward_IVRSystem_GetEventTypeNameFromEnum();
 	Forward_IVRSystem_GetHiddenAreaMesh_026();
 	Forward_IVRSystem_GetControllerState_026();
@@ -88,6 +86,7 @@ public:
 	{
 		openvr_logger logger;
 		OPENVR_LOGGER_INIT(logger);
+
 		OPENVR_LOG_UNIMPLEMENTED(logger, "AcknowledgeQuit_UserPrompt()");
 	}
 

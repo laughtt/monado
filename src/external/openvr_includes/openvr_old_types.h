@@ -59,13 +59,7 @@ enum Compositor_DeviceType
 	Compositor_DeviceType_OpenGL
 };
 
-/** Allows the application to control what part of the provided texture will be used in the
- * frame buffer. */
-struct Compositor_TextureBounds
-{
-	float uMin, vMin;
-	float uMax, vMax;
-};
+typedef VRTextureBounds_t Compositor_TextureBounds;
 
 /** Allows the application to customize how the overlay appears in the compositor */
 struct Compositor_OverlaySettings

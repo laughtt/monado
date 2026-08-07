@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief Implementation of the IVRChaperoneSetup interface version 003.
+ * @brief Implementation of the IVRChaperoneSetup interface version 005.
  *
  * @author Beyley Cardellio <ep1cm1n10n123@gmail.com>
  * @ingroup openvr_interfaces
@@ -15,7 +15,7 @@
 #include "openvr_interfaces_unified.h"
 #include "openvr_forward_macros.h"
 
-#include "interfaces/XRTVRChaperone.hpp"
+#include "interfaces/XRTVRChaperoneSetup.hpp"
 
 
 namespace xrt::state_trackers::openvr {
@@ -55,8 +55,9 @@ public:
 		openvr_logger logger;
 		OPENVR_LOGGER_INIT(logger);
 
-		OPENVR_LOG_UNIMPLEMENTED(logger, "SetWorkingCollisionBoundsTagsInfo(pTagsBuffer=%p, unTagCount=%u)",
-		                         static_cast<void *>(pTagsBuffer), unTagCount);
+		OPENVR_LOG_UNIMPLEMENTED(logger, "SetWorkingCollisionBoundsTagsInfo(pTagsBuffer=%p, unTagCount=%llu)",
+		                         static_cast<const void *>(pTagsBuffer),
+		                         static_cast<unsigned long long>(unTagCount));
 	}
 
 	bool
@@ -67,8 +68,8 @@ public:
 		OPENVR_LOGGER_INIT(logger);
 
 		OPENVR_LOG_UNIMPLEMENTED_RET(
-		    logger, "GetLiveCollisionBoundsTagsInfo(pTagsBuffer=%p, punTagCount=%p) -> %d", false,
-		    static_cast<void *>(pTagsBuffer), static_cast<void *>(punTagCount), false);
+		    logger, "GetLiveCollisionBoundsTagsInfo(pTagsBuffer=%p, punTagCount=%p) -> false", false,
+		    static_cast<const void *>(pTagsBuffer), static_cast<const void *>(punTagCount));
 	}
 
 	bool
@@ -78,9 +79,9 @@ public:
 		openvr_logger logger;
 		OPENVR_LOGGER_INIT(logger);
 
-		OPENVR_LOG_UNIMPLEMENTED_RET(logger,
-		                             "SetWorkingPhysicalBoundsInfo(pQuadsBuffer=%p, unQuadsCount=%u) -> %d",
-		                             false, static_cast<void *>(pQuadsBuffer), unQuadsCount, false);
+		OPENVR_LOG_UNIMPLEMENTED_RET(
+		    logger, "SetWorkingPhysicalBoundsInfo(pQuadsBuffer=%p, unQuadsCount=%llu) -> false", false,
+		    static_cast<const void *>(pQuadsBuffer), static_cast<unsigned long long>(unQuadsCount));
 	}
 
 	bool
@@ -91,8 +92,8 @@ public:
 		OPENVR_LOGGER_INIT(logger);
 
 		OPENVR_LOG_UNIMPLEMENTED_RET(
-		    logger, "GetLivePhysicalBoundsInfo(pQuadsBuffer=%p, punQuadsCount=%p) -> %d", false,
-		    static_cast<void *>(pQuadsBuffer), static_cast<void *>(punQuadsCount), false);
+		    logger, "GetLivePhysicalBoundsInfo(pQuadsBuffer=%p, punQuadsCount=%p) -> false", false,
+		    static_cast<const void *>(pQuadsBuffer), static_cast<const void *>(punQuadsCount));
 	}
 
 	Forward_IVRChaperoneSetup_ExportLiveToBuffer();
