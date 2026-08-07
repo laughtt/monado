@@ -42,6 +42,14 @@ SwapchainCache::ensureSwapchain(xrt_compositor *xc,
 		return XRT_SUCCESS;
 	}
 
+	// OpenVR apps will sometimes do silly things, this stops that
+	width = MAX(width, 1);
+	height = MAX(height, 1);
+
+	if (width > xc->info.max_texture_size || height > xc->info.max_texture_size) {
+		return XRT_ERROR_ALLOCATION;
+	}
+
 	// Free the existing swapchain if it exists, since the cache failed
 	if (this->xsc != nullptr) {
 		this->width = 0;
@@ -208,7 +216,7 @@ Compositor::submit(openvr_logger &logger,
                    vr::EVREye eye,
                    const vr::Texture_t &texture,
                    uint32_t array_index,
-                   const vr::VRTextureBounds_t &bounds,
+                   vr::VRTextureBounds_t bounds,
                    vr::EVRSubmitFlags nSubmitFlags)
 {
 	// @todo return DoNotHaveFocus if the application doesn't have focus
@@ -231,6 +239,11 @@ Compositor::submit(openvr_logger &logger,
 		OPENVR_LOG_ERROR(logger, "Already submitted for eye %d in this frame.", eye);
 		return vr::EVRCompositorError::VRCompositorError_AlreadySubmitted;
 	}
+
+	bounds.uMin = MAX(0.0f, bounds.uMin);
+	bounds.vMin = MAX(0.0f, bounds.vMin);
+	bounds.uMax = MIN(1.0f, bounds.uMax);
+	bounds.vMax = MIN(1.0f, bounds.vMax);
 
 	switch (texture.eType) {
 #ifdef XRT_HAVE_VULKAN

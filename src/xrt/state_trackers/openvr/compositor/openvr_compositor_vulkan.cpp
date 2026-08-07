@@ -815,8 +815,11 @@ Compositor::submitVulkan(openvr_logger &logger,
 {
 	// @todo validate what parts of `texture_data` we need to validate and return InvalidTexture when invalid
 
-	OPENVR_LOG_TRACE(logger, "Submitting Vulkan texture for eye %d, image: %p, format: %d, color space: %d", eye,
-	                 (void *)texture_data.m_nImage, texture_data.m_nFormat, color_space);
+	OPENVR_LOG_TRACE(logger,
+	                 "Submitting Vulkan texture for eye %d, image: %p, format: %d, color space: %d, extents: "
+	                 "%dx%d, bounds: %fx%f,%fx%f",
+	                 eye, (void *)texture_data.m_nImage, texture_data.m_nFormat, color_space, texture_data.m_nWidth,
+	                 texture_data.m_nHeight, bounds.uMin, bounds.vMin, bounds.uMax, bounds.vMax);
 
 	if (this->active_compositor == nullptr) {
 		xrt_result_t xret = this->setupVulkanCompositor(logger, texture_data);
@@ -851,6 +854,11 @@ Compositor::submitVulkan(openvr_logger &logger,
 	        },
 	};
 
+	// Don't let 0 width submits cause problems
+	if (source_rect.extent.w == 0 || source_rect.extent.h == 0) {
+		return vr::EVRCompositorError::VRCompositorError_None;
+	}
+
 	// The storage format
 	const VkFormat storage_format =
 	    resolveSwapchainStorageFormat(static_cast<VkFormat>(texture_data.m_nFormat), swapchain_sample_format);
@@ -873,7 +881,7 @@ Compositor::submitVulkan(openvr_logger &logger,
 
 	xrt_result_t xret =
 	    cache.ensureSwapchain(this->active_compositor, storage_format, swapchain_sample_format,
-	                          source_rect.extent.w, source_rect.extent.h, swapchain_bits, swapchain_flags);
+	                          texture_data.m_nWidth, texture_data.m_nHeight, swapchain_bits, swapchain_flags);
 	if (xret != XRT_SUCCESS) {
 		OPENVR_LOG_ERROR_XRET(logger, "Failed to get swapchain for submitted texture", xret);
 		return xretToCompositorError(xret);
@@ -930,8 +938,8 @@ Compositor::submitVulkan(openvr_logger &logger,
 	            .xsc = nullptr,
 	            .swapchain_index = image_index,
 
-	            .width = static_cast<uint32_t>(source_rect.extent.w),
-	            .height = static_cast<uint32_t>(source_rect.extent.h),
+	            .width = cache.width,
+	            .height = cache.height,
 
 	            .bounds = full_swapchain_rect,
 	        },
