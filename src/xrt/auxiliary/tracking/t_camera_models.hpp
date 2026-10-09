@@ -538,8 +538,9 @@ undistort(const t_camera_model_params &dist, const T &x, const T &y, T &out_x, T
 {
 	switch (dist.model) {
 	case T_DISTORTION_PINHOLE: {
-		out_x = x;
-		out_y = y;
+		// Like the other models, output normalized image coordinates.
+		out_x = (x - T(dist.cx)) / T(dist.fx);
+		out_y = (y - T(dist.cy)) / T(dist.fy);
 	}; break;
 	case T_DISTORTION_OPENCV_RADTAN_8: {
 		rt8_undistort(dist, x, y, out_x, out_y);

@@ -110,8 +110,9 @@ t_camera_model_params_from_t_camera_calibration(const t_camera_calibration *cc, 
 		out_params->cv1.g3 = (float)cc->cv1.g3;
 		out_params->cv1.g4 = (float)cc->cv1.g4;
 	} break;
+	case T_DISTORTION_PINHOLE: break; // no params
 	default:
-		U_LOG_E("t_camera_un_projections doesn't support camera model %s yet!",
+		U_LOG_E("t_camera_model_params_from_t_camera_calibration doesn't support camera model %s yet!",
 		        t_stringify_camera_distortion_model(cc->distortion_model));
 		break;
 	}
