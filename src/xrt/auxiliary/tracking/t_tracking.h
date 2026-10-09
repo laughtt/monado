@@ -288,6 +288,24 @@ struct t_camera_calibration
 };
 
 /*!
+ * Fills in a basic intrinsics matrix using the standard set of parameters.
+ */
+static inline void
+t_camera_calibration_fill_intrinsics(
+    struct t_camera_calibration *calibration, double fx, double fy, double cx, double cy)
+{
+	double intrinsics[3][3] = {
+	    // clang-format off
+	    {fx,  0.0, cx},
+	    {0.0, fy,  cy},
+	    {0.0, 0.0, 1.0},
+	    // clang-format on
+	};
+
+	memcpy(calibration->intrinsics, intrinsics, sizeof(intrinsics));
+}
+
+/*!
  * Stereo camera calibration data to be given to trackers.
  */
 struct t_stereo_camera_calibration
@@ -520,15 +538,18 @@ t_convert_in_place_h8s8v8_to_r8g8b8(uint32_t width, uint32_t height, size_t stri
 #define T_HSV_SIZE 32
 #define T_HSV_STEP (256 / T_HSV_SIZE)
 
+// @todo Remove this when clang-format is updated in CI
+// clang-format off
 #define T_HSV_DEFAULT_PARAMS()                                                                                         \
 	{                                                                                                              \
-		{                                                                                                      \
-		    {165, 30, 160, 100},                                                                               \
-		    {135, 30, 160, 100},                                                                               \
-		    {95, 30, 160, 100},                                                                                \
-		},                                                                                                     \
-		    {128, 80},                                                                                         \
+	    {                                                                                                          \
+	        {165, 30, 160, 100},                                                                                   \
+	        {135, 30, 160, 100},                                                                                   \
+	        {95, 30, 160, 100},                                                                                    \
+	    },                                                                                                         \
+	    {128, 80},                                                                                                 \
 	}
+// clang-format on
 
 struct t_hsv_filter_color
 {
