@@ -535,6 +535,13 @@ if(XRT_HAVE_XLIB AND NOT XRT_HAVE_XRANDR)
 	message(WARNING "XRT_HAVE_XLIB requires XRT_HAVE_XRANDR but XRT_HAVE_XRANDR is disabled")
 endif()
 
+if(XRT_HAVE_OPENGL_GLX AND NOT XRT_HAVE_XLIB)
+	message(
+		FATAL_ERROR
+			"XRT_HAVE_OPENGL_GLX requires XRT_HAVE_XLIB but XRT_HAVE_XLIB is disabled"
+		)
+endif()
+
 if(XRT_HAVE_OPENGLES AND NOT XRT_HAVE_EGL)
 	message(FATAL_ERROR "XRT_HAVE_OPENGLES requires XRT_HAVE_EGL but XRT_HAVE_EGL is disabled")
 endif()
