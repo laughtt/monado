@@ -122,7 +122,9 @@ m_clock_windowed_skew_tracker_push(struct m_clock_windowed_skew_tracker *t,
 		}
 		t->clock_reset_ts = 0;
 	}
+
 	t->last_observation = obs;
+	t->have_last_observation = true;
 
 	if (t->current_window_samples < t->max_window_samples) {
 		/* Window is still being filled */
