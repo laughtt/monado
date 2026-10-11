@@ -429,7 +429,7 @@ wmr_create_bt_controller(struct xrt_prober *xp,
 	    XRT_PROBER_STRING_PRODUCT,              //
 	    (uint8_t *)product_name,                //
 	    sizeof(product_name));                  //
-	if (ret != 0) {
+	if (ret <= 0) {
 		U_LOG_IFL_E(log_level, "Failed to get WMR Bluetooth controller string descriptor");
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
