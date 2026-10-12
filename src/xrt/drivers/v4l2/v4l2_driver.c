@@ -17,6 +17,7 @@
 #include "util/u_format.h"
 #include "util/u_logging.h"
 #include "util/u_trace_marker.h"
+#include "util/u_frameserver.h"
 
 #include "v4l2_interface.h"
 #include "v4l2_driver.h"
@@ -539,17 +540,19 @@ v4l2_fs_setup_format(struct v4l2_fs *vid)
  *
  */
 
-static bool
+static xrt_result_t
 v4l2_fs_enumerate_modes(struct xrt_fs *xfs, struct xrt_fs_mode **out_modes, uint32_t *out_count)
 {
 	struct v4l2_fs *vid = v4l2_fs(xfs);
 	if (vid->num_descriptors == 0) {
-		return false;
+		(*out_count) = 0;
+		(*out_modes) = NULL;
+		return XRT_SUCCESS;
 	}
 
 	struct xrt_fs_mode *modes = U_TYPED_ARRAY_CALLOC(struct xrt_fs_mode, vid->num_descriptors);
 	if (modes == NULL) {
-		return false;
+		return XRT_ERROR_ALLOCATION;
 	}
 
 	for (uint32_t i = 0; i < vid->num_descriptors; i++) {
@@ -559,18 +562,18 @@ v4l2_fs_enumerate_modes(struct xrt_fs *xfs, struct xrt_fs_mode **out_modes, uint
 	*out_modes = modes;
 	*out_count = vid->num_descriptors;
 
-	return true;
+	return XRT_SUCCESS;
 }
 
-static bool
+static xrt_result_t
 v4l2_fs_configure_capture(struct xrt_fs *xfs, struct xrt_fs_capture_parameters *cp)
 {
 	// struct v4l2_fs *vid = v4l2_fs(xfs);
 	//! @todo
-	return false;
+	return XRT_SUCCESS;
 }
 
-static bool
+static xrt_result_t
 v4l2_fs_stream_start(struct xrt_fs *xfs,
                      struct xrt_frame_sink *xs,
                      enum xrt_fs_capture_type capture_type,
@@ -580,7 +583,7 @@ v4l2_fs_stream_start(struct xrt_fs *xfs,
 
 	if (descriptor_index >= vid->num_descriptors) {
 		V4L2_ERROR(vid, "error Invalid descriptor_index (%i >= %i)", descriptor_index, vid->num_descriptors);
-		return false;
+		return XRT_ERROR_INVALID_ARGUMENT;
 	}
 	vid->selected = descriptor_index;
 
@@ -590,42 +593,44 @@ v4l2_fs_stream_start(struct xrt_fs *xfs,
 
 	if (!v4l2_fs_setup_format(vid)) {
 		vid->is_running = false;
-		return false;
+		return XRT_ERROR_STREAMING_START_FAILED;
 	}
 
 	if (pthread_create(&vid->stream_thread, NULL, v4l2_fs_mainloop, xfs)) {
 		vid->is_running = false;
 		V4L2_ERROR(vid, "error: Could not create thread");
-		return false;
+		return XRT_ERROR_THREADING_INIT_FAILURE;
 	}
 
 	V4L2_TRACE(vid, "info: Started!");
 
 	// we're off to the races!
-	return true;
+	return XRT_SUCCESS;
 }
 
-static bool
+static xrt_result_t
 v4l2_fs_stream_stop(struct xrt_fs *xfs)
 {
 	struct v4l2_fs *vid = v4l2_fs(xfs);
 
 	if (!vid->is_running) {
-		return true;
+		return XRT_SUCCESS;
 	}
 
 	vid->is_running = false;
 	pthread_join(vid->stream_thread, NULL);
 
-	return true;
+	return XRT_SUCCESS;
 }
 
-static bool
-v4l2_fs_is_running(struct xrt_fs *xfs)
+static xrt_result_t
+v4l2_fs_is_running(struct xrt_fs *xfs, bool *out_is_running)
 {
 	struct v4l2_fs *vid = v4l2_fs(xfs);
 
-	return vid->is_running;
+	(*out_is_running) = vid->is_running;
+
+	return XRT_SUCCESS;
 }
 
 static void
@@ -683,6 +688,7 @@ v4l2_fs_create(struct xrt_frame_context *xfctx,
                const char *serial)
 {
 	struct v4l2_fs *vid = U_TYPED_CALLOC(struct v4l2_fs);
+	u_frameserver_populate_function_pointers(&vid->base);
 	vid->base.enumerate_modes = v4l2_fs_enumerate_modes;
 	vid->base.configure_capture = v4l2_fs_configure_capture;
 	vid->base.stream_start = v4l2_fs_stream_start;

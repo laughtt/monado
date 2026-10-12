@@ -39,43 +39,44 @@ public:
 	xrt_fs_capture_type capture_type = XRT_FS_CAPTURE_TYPE_TRACKING;
 	uint32_t descriptor_index = 0;
 
-	bool
+	xrt_result_t
 	enumerateModes(struct xrt_fs_mode **out_modes, uint32_t *out_count)
 	{
 		enumerate_modes_count++;
 		*out_modes = nullptr;
 		*out_count = 0;
-		return true;
+		return XRT_SUCCESS;
 	}
 
-	bool
+	xrt_result_t
 	configureCapture(struct xrt_fs_capture_parameters *cp)
 	{
 		configure_capture_count++;
-		return true;
+		return XRT_SUCCESS;
 	}
 
-	bool
+	xrt_result_t
 	streamStart(struct xrt_frame_sink *xs, enum xrt_fs_capture_type type, uint32_t index)
 	{
 		sink = xs;
 		capture_type = type;
 		descriptor_index = index;
 		running = true;
-		return true;
+		return XRT_SUCCESS;
 	}
 
-	bool
+	xrt_result_t
 	streamStop()
 	{
 		running = false;
-		return true;
+		return XRT_SUCCESS;
 	}
 
-	bool
-	isRunning()
+	xrt_result_t
+	isRunning(bool &is_running)
 	{
-		return running;
+		is_running = this->running;
+		return XRT_SUCCESS;
 	}
 
 	void
@@ -100,41 +101,41 @@ class SlamTestFrameServer : public xrt::util::FrameServerBase<SlamTestFrameServe
 public:
 	int slam_stream_start_count = 0;
 
-	bool
+	xrt_result_t
 	enumerateModes(struct xrt_fs_mode **out_modes, uint32_t *out_count)
 	{
-		return false;
+		return XRT_ERROR_NOT_IMPLEMENTED;
 	}
 
-	bool
+	xrt_result_t
 	configureCapture(struct xrt_fs_capture_parameters *cp)
 	{
-		return false;
+		return XRT_ERROR_NOT_IMPLEMENTED;
 	}
 
-	bool
+	xrt_result_t
 	streamStart(struct xrt_frame_sink *xs, enum xrt_fs_capture_type type, uint32_t index)
 	{
-		return false;
+		return XRT_ERROR_NOT_IMPLEMENTED;
 	}
 
-	bool
+	xrt_result_t
 	slamStreamStart(struct xrt_slam_sinks *sinks)
 	{
 		slam_stream_start_count++;
-		return true;
+		return XRT_SUCCESS;
 	}
 
-	bool
+	xrt_result_t
 	streamStop()
 	{
-		return false;
+		return XRT_ERROR_NOT_IMPLEMENTED;
 	}
 
-	bool
-	isRunning()
+	xrt_result_t
+	isRunning(bool &is_running)
 	{
-		return false;
+		return XRT_ERROR_NOT_IMPLEMENTED;
 	}
 };
 
@@ -144,32 +145,32 @@ public:
 class ThrowingTestFrameServer : public xrt::util::FrameServerBase<ThrowingTestFrameServer, kMinimalFunctions>
 {
 public:
-	bool
+	xrt_result_t
 	enumerateModes(struct xrt_fs_mode **out_modes, uint32_t *out_count)
 	{
 		throw std::runtime_error("enumerateModes");
 	}
 
-	bool
+	xrt_result_t
 	configureCapture(struct xrt_fs_capture_parameters *cp)
 	{
 		throw std::runtime_error("configureCapture");
 	}
 
-	bool
+	xrt_result_t
 	streamStart(struct xrt_frame_sink *xs, enum xrt_fs_capture_type type, uint32_t index)
 	{
 		throw std::runtime_error("streamStart");
 	}
 
-	bool
+	xrt_result_t
 	streamStop()
 	{
 		throw std::runtime_error("streamStop");
 	}
 
-	bool
-	isRunning()
+	xrt_result_t
+	isRunning(bool &is_running)
 	{
 		throw std::runtime_error("isRunning");
 	}
@@ -186,13 +187,14 @@ TEST_CASE("FrameServerBase_Minimal")
 		REQUIRE(xfs->enumerate_modes != nullptr);
 		REQUIRE(xfs->configure_capture != nullptr);
 		REQUIRE(xfs->stream_start != nullptr);
+		REQUIRE(xfs->slam_stream_start != nullptr);
 		REQUIRE(xfs->stream_stop != nullptr);
 		REQUIRE(xfs->is_running != nullptr);
 	}
 
 	SECTION("Disabled optional functions fail cleanly")
 	{
-		REQUIRE(xfs->slam_stream_start(xfs, nullptr) == false);
+		REQUIRE(xfs->slam_stream_start(xfs, nullptr) == XRT_ERROR_NOT_IMPLEMENTED);
 	}
 
 	SECTION("Identifying fields are zeroed")
@@ -213,24 +215,28 @@ TEST_CASE("FrameServerBase_Minimal")
 	{
 		xrt_fs_mode *modes = nullptr;
 		uint32_t count = 1;
-		REQUIRE(xrt_fs_enumerate_modes(xfs, &modes, &count));
+		REQUIRE(xrt_fs_enumerate_modes(xfs, &modes, &count) == XRT_SUCCESS);
 		REQUIRE(fs.enumerate_modes_count == 1);
 		REQUIRE(count == 0);
 
 		xrt_fs_capture_parameters cp = {};
-		REQUIRE(xrt_fs_configure_capture(xfs, &cp));
+		REQUIRE(xrt_fs_configure_capture(xfs, &cp) == XRT_SUCCESS);
 		REQUIRE(fs.configure_capture_count == 1);
 
 		xrt_frame_sink sink = {};
-		REQUIRE_FALSE(xrt_fs_is_running(xfs));
-		REQUIRE(xrt_fs_stream_start(xfs, &sink, XRT_FS_CAPTURE_TYPE_CALIBRATION, 3));
-		REQUIRE(xrt_fs_is_running(xfs));
+		bool running;
+		REQUIRE(xrt_fs_is_running(xfs, &running) == XRT_SUCCESS);
+		REQUIRE_FALSE(running);
+		REQUIRE(xrt_fs_stream_start(xfs, &sink, XRT_FS_CAPTURE_TYPE_CALIBRATION, 3) == XRT_SUCCESS);
+		REQUIRE(xrt_fs_is_running(xfs, &running) == XRT_SUCCESS);
+		REQUIRE(running);
 		REQUIRE(fs.sink == &sink);
 		REQUIRE(fs.capture_type == XRT_FS_CAPTURE_TYPE_CALIBRATION);
 		REQUIRE(fs.descriptor_index == 3);
 
-		REQUIRE(xrt_fs_stream_stop(xfs));
-		REQUIRE_FALSE(xrt_fs_is_running(xfs));
+		REQUIRE(xrt_fs_stream_stop(xfs) == XRT_SUCCESS);
+		REQUIRE(xrt_fs_is_running(xfs, &running) == XRT_SUCCESS);
+		REQUIRE_FALSE(running);
 	}
 }
 
@@ -240,7 +246,7 @@ TEST_CASE("FrameServerBase_Slam")
 	auto *xfs = fs.getXFS();
 
 	REQUIRE(xfs->slam_stream_start != nullptr);
-	REQUIRE(xrt_fs_slam_stream_start(xfs, nullptr));
+	REQUIRE(xrt_fs_slam_stream_start(xfs, nullptr) == XRT_SUCCESS);
 	REQUIRE(fs.slam_stream_start_count == 1);
 }
 
@@ -253,11 +259,12 @@ TEST_CASE("FrameServerBase_Exceptions")
 	uint32_t count = 0;
 	xrt_fs_capture_parameters cp = {};
 
-	REQUIRE_FALSE(xrt_fs_enumerate_modes(xfs, &modes, &count));
-	REQUIRE_FALSE(xrt_fs_configure_capture(xfs, &cp));
-	REQUIRE_FALSE(xrt_fs_stream_start(xfs, nullptr, XRT_FS_CAPTURE_TYPE_TRACKING, 0));
-	REQUIRE_FALSE(xrt_fs_stream_stop(xfs));
-	REQUIRE_FALSE(xrt_fs_is_running(xfs));
+	bool running;
+	REQUIRE(xrt_fs_enumerate_modes(xfs, &modes, &count) == XRT_ERROR_UNCAUGHT_EXCEPTION);
+	REQUIRE(xrt_fs_configure_capture(xfs, &cp) == XRT_ERROR_UNCAUGHT_EXCEPTION);
+	REQUIRE(xrt_fs_stream_start(xfs, nullptr, XRT_FS_CAPTURE_TYPE_TRACKING, 0) == XRT_ERROR_UNCAUGHT_EXCEPTION);
+	REQUIRE(xrt_fs_stream_stop(xfs) == XRT_ERROR_UNCAUGHT_EXCEPTION);
+	REQUIRE(xrt_fs_is_running(xfs, &running) == XRT_ERROR_UNCAUGHT_EXCEPTION);
 }
 
 TEST_CASE("FrameNodeBase_WithFrameServer")

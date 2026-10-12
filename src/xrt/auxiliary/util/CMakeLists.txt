@@ -54,6 +54,10 @@ add_library(
 	u_format.h
 	u_frame.c
 	u_frame.h
+	u_frameserver.c
+	u_frameserver.h
+	u_frameserver_ni.c
+	u_frameserver_ni.h
 	u_future.h
 	u_future.cpp
 	u_generic_callbacks.hpp

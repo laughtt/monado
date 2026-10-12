@@ -6,24 +6,29 @@
  * @author Mateo de Mayo <mateo.demayo@collabora.com>
  * @ingroup drv_wmr
  */
-#include "wmr_source.h"
-#include "wmr_camera.h"
-#include "wmr_config.h"
-#include "wmr_protocol.h"
+
+#include "xrt/xrt_tracking.h"
+#include "xrt/xrt_frameserver.h"
 
 #include "math/m_api.h"
 #include "math/m_clock_tracking.h"
 #include "math/m_filter_fifo.h"
+
 #include "tracking/t_euroc_recorder.h"
+
 #include "util/u_debug.h"
 #include "util/u_sink.h"
 #include "util/u_var.h"
 #include "util/u_trace_marker.h"
-#include "xrt/xrt_tracking.h"
-#include "xrt/xrt_frameserver.h"
+#include "util/u_frameserver.h"
+
+#include "wmr_source.h"
+#include "wmr_camera.h"
+#include "wmr_config.h"
 
 #include <assert.h>
 #include <stdio.h>
+
 
 #define WMR_SOURCE_STR "WMR Source"
 
@@ -177,21 +182,24 @@ wmr_source_from_xfs(struct xrt_fs *xfs)
 	return ws;
 }
 
-static bool
+static xrt_result_t
 wmr_source_enumerate_modes(struct xrt_fs *xfs, struct xrt_fs_mode **out_modes, uint32_t *out_count)
 {
-	WMR_ASSERT(false, "Not implemented");
-	return false;
+	//! @todo We should probably implement this with just the base mode.
+	struct wmr_source *ws = wmr_source_from_xfs(xfs);
+	WMR_ERROR(ws, "Mode enumeration is not implemented.");
+	return XRT_ERROR_NOT_IMPLEMENTED;
 }
 
-static bool
+static xrt_result_t
 wmr_source_configure_capture(struct xrt_fs *xfs, struct xrt_fs_capture_parameters *cp)
 {
-	WMR_ASSERT(false, "Not implemented");
-	return false;
+	struct wmr_source *ws = wmr_source_from_xfs(xfs);
+	WMR_WARN(ws, "Configuring capture is not implemented.");
+	return XRT_SUCCESS;
 }
 
-static bool
+static xrt_result_t
 wmr_source_stream_stop(struct xrt_fs *xfs)
 {
 	DRV_TRACE_MARKER();
@@ -201,22 +209,23 @@ wmr_source_stream_stop(struct xrt_fs *xfs)
 	bool stopped = wmr_camera_stop(ws->camera);
 	if (!stopped) {
 		WMR_ERROR(ws, "Unable to stop WMR cameras");
-		WMR_ASSERT_(false);
+		return XRT_ERROR_USB_COMMAND_FAILED;
 	}
 
-	return stopped;
+	return XRT_SUCCESS;
 }
 
-static bool
-wmr_source_is_running(struct xrt_fs *xfs)
+static xrt_result_t
+wmr_source_is_running(struct xrt_fs *xfs, bool *out_is_running)
 {
 	DRV_TRACE_MARKER();
 
 	struct wmr_source *ws = wmr_source_from_xfs(xfs);
-	return ws->is_running;
+	(*out_is_running) = ws->is_running;
+	return XRT_SUCCESS;
 }
 
-static bool
+static xrt_result_t
 wmr_source_stream_start(struct xrt_fs *xfs,
                         struct xrt_frame_sink *xs,
                         enum xrt_fs_capture_type capture_type,
@@ -233,21 +242,20 @@ wmr_source_stream_start(struct xrt_fs *xfs,
 		ws->out_sinks.cam_count = 1;
 		ws->out_sinks.cams[0] = xs;
 	} else {
-		WMR_ASSERT(false, "Unsupported stream configuration xs=%p capture_type=%d", (void *)xs, capture_type);
-		return false;
+		WMR_ERROR(ws, "Unsupported stream configuration xs=%p capture_type=%d", (void *)xs, capture_type);
+		return XRT_ERROR_INVALID_ARGUMENT;
 	}
 
-	bool started = wmr_camera_start(ws->camera);
-	if (!started) {
+	ws->is_running = wmr_camera_start(ws->camera);
+	if (!ws->is_running) {
 		WMR_ERROR(ws, "Unable to start WMR cameras");
-		WMR_ASSERT_(false);
+		return XRT_ERROR_USB_COMMAND_FAILED;
 	}
 
-	ws->is_running = started;
-	return ws->is_running;
+	return XRT_SUCCESS;
 }
 
-static bool
+static xrt_result_t
 wmr_source_slam_stream_start(struct xrt_fs *xfs, struct xrt_slam_sinks *sinks)
 {
 	DRV_TRACE_MARKER();
@@ -314,6 +322,7 @@ wmr_source_create(struct xrt_frame_context *xfctx, struct xrt_prober_device *dev
 
 	// Setup xrt_fs
 	struct xrt_fs *xfs = &ws->xfs;
+	u_frameserver_populate_function_pointers(xfs);
 	xfs->enumerate_modes = wmr_source_enumerate_modes;
 	xfs->configure_capture = wmr_source_configure_capture;
 	xfs->stream_start = wmr_source_stream_start;

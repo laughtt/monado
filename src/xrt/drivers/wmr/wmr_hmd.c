@@ -37,6 +37,7 @@
 #include "util/u_trace_marker.h"
 #include "util/u_distortion_mesh.h"
 #include "util/u_sink.h"
+#include "util/u_pretty_print.h"
 
 #ifdef XRT_OS_LINUX
 #include "util/u_linux.h"
@@ -1997,10 +1998,10 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 	}
 
 	// Stream data source into sinks (if populated)
-	bool stream_started = xrt_fs_slam_stream_start(wh->tracking.source, &sinks);
-	if (!stream_started) {
+	xrt_result_t xret = xrt_fs_slam_stream_start(wh->tracking.source, &sinks);
+	if (xret != XRT_SUCCESS) {
 		//! @todo Could reach this due to !XRT_HAVE_LIBUSB but the HMD should keep working
-		WMR_WARN(wh, "Failed to start WMR source");
+		WMR_WARN(wh, "Failed to start WMR source, got %s", u_str_xrt_result(xret));
 		wmr_hmd_destroy(&wh->base);
 		wh = NULL;
 		return;

@@ -298,12 +298,13 @@ rift_sensor_create(struct rift_sensor_context *context,
 	}
 
 	struct xrt_fs_mode *supported_modes;
-	uint32_t mode_count;
-	bool success = xrt_fs_enumerate_modes(sensor->frame_server, &supported_modes, &mode_count);
-	if (!success || mode_count == 0) {
+	uint32_t mode_count = 0;
+	xrt_result_t xret = xrt_fs_enumerate_modes(sensor->frame_server, &supported_modes, &mode_count);
+	if (xret != XRT_SUCCESS || mode_count == 0) {
 		libusb_close(device_handle);
-		SENSOR_ERROR(context, "Failed to enumerate UVC frameserver for sensor, mode count %d, skipping.",
-		             mode_count);
+		SENSOR_ERROR(context,
+		             "Failed to enumerate UVC frameserver for sensor, mode count %d, skipping, got xret %d.",
+		             mode_count, xret);
 
 		return -1;
 	}

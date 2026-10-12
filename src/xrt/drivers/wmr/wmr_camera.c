@@ -689,20 +689,12 @@ wmr_camera_stop(struct wmr_camera *cam)
 
 	res = set_active(cam, false);
 	if (res < 0) {
-		goto fail;
+		WMR_CAM_ERROR(cam, "Error stopping camera input: %s", libusb_error_name(res));
+		return false;
 	}
 
 	WMR_CAM_INFO(cam, "WMR camera stopped");
-
 	return true;
-
-
-fail:
-	if (res < 0) {
-		WMR_CAM_ERROR(cam, "Error stopping camera input: %s", libusb_error_name(res));
-	}
-
-	return false;
 }
 
 static int

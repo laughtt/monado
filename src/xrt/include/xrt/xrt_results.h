@@ -217,7 +217,7 @@ typedef enum xrt_result
 	XRT_ERROR_OUTPUT_UNSUPPORTED = -34,
 
 	/*!
-	 * The requested operation failed, verify the log to know more.
+	 * The requested output operation failed, verify the log to know more.
 	 */
 	XRT_ERROR_OUTPUT_REQUEST_FAILURE = -35,
 
@@ -272,4 +272,19 @@ typedef enum xrt_result
 	 * The IPC client did not create a system yet, which is required for this function.
 	 */
 	XRT_ERROR_IPC_SYSTEM_NOT_CREATED = -45,
+
+	/*!
+	 * A USB command failed to execute, such as failing to set the alternate setting of an interface,
+	 * or failing to execute a feature get.
+	 *
+	 * These errors may be transient and it is reasonable to try few times.
+	 */
+	XRT_ERROR_USB_COMMAND_FAILED = -46,
+
+	/*!
+	 * The frameserver stream failed to start for some unknown reason, check the logs for more information.
+	 *
+	 * This does not, however, indicate a permanent inability to start the stream. Other modes may work.
+	 */
+	XRT_ERROR_STREAMING_START_FAILED = -47,
 } xrt_result_t;

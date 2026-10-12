@@ -596,8 +596,10 @@ rift_open_system_impl(struct xrt_builder *xb,
 
 			struct xrt_fs *fs = rift_sensor_get_frame_server(sensor);
 
-			if (!xrt_fs_stream_start(fs, frame_sink, XRT_FS_CAPTURE_TYPE_TRACKING, 0)) {
-				RIFT_WARN(rb, "Failed to start Rift sensor frame server stream for sensor %u", i);
+			xret = xrt_fs_stream_start(fs, frame_sink, XRT_FS_CAPTURE_TYPE_TRACKING, 0);
+			if (xret != XRT_SUCCESS) {
+				RIFT_WARN(rb, "Failed to start Rift sensor frame server stream for sensor %u, got %d",
+				          i, xret);
 				continue;
 			}
 

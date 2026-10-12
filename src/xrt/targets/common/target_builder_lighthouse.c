@@ -482,9 +482,9 @@ stream_data_sources(struct lighthouse_system *lhs,
 		vive_source_hook_into_sinks(vive_head->source, &sinks);
 	}
 
-	bool bret = xrt_fs_stream_start(lhs->xfs, sinks.cams[0], XRT_FS_CAPTURE_TYPE_TRACKING, mode);
-	if (!bret) {
-		LH_ERROR("Unable to start data streaming");
+	xrt_result_t xret = xrt_fs_stream_start(lhs->xfs, sinks.cams[0], XRT_FS_CAPTURE_TYPE_TRACKING, mode);
+	if (xret != XRT_SUCCESS) {
+		LH_ERROR("Unable to start data streaming, got %d", xret);
 		return false;
 	}
 

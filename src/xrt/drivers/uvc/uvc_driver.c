@@ -12,6 +12,7 @@
  */
 
 #include "util/u_debug.h"
+#include "util/u_frameserver.h"
 
 #include "math/m_api.h"
 
@@ -360,34 +361,40 @@ iso_transfer_cb(struct libusb_transfer *transfer)
 	}
 }
 
-static bool
+static xrt_result_t
 uvc_fs_enumerate_modes(struct xrt_fs *xfs, struct xrt_fs_mode **out_modes, uint32_t *out_count)
 {
 	struct uvc_fs *fs = uvc_fs(xfs);
 
-	*out_count = 1;
 	*out_modes = U_TYPED_ARRAY_CALLOC(struct xrt_fs_mode, *out_count);
+	if ((*out_modes) == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	*out_count = 1;
+
 	(**out_modes) = fs->mode;
 
-	return true;
+	return XRT_SUCCESS;
 }
 
-static bool
+static xrt_result_t
 uvc_fs_configure_capture(struct xrt_fs *xfs, struct xrt_fs_capture_parameters *cp)
 {
 	// @todo
-	return false;
+	return XRT_SUCCESS;
 }
 
-static bool
-uvc_fs_is_running(struct xrt_fs *xfs)
+static xrt_result_t
+uvc_fs_is_running(struct xrt_fs *xfs, bool *out_is_running)
 {
 	struct uvc_fs *fs = uvc_fs(xfs);
 
-	return fs->is_running;
+	(*out_is_running) = fs->is_running;
+
+	return XRT_SUCCESS;
 }
 
-static bool
+static xrt_result_t
 uvc_fs_stream_stop(struct xrt_fs *xfs)
 {
 	int ret;
@@ -432,10 +439,10 @@ uvc_fs_stream_stop(struct xrt_fs *xfs)
 	free(stream->alloced_frames);
 	free(stream->free_frames);
 
-	return true;
+	return XRT_SUCCESS;
 }
 
-static bool
+static xrt_result_t
 uvc_fs_stream_start(struct xrt_fs *xfs,
                     struct xrt_frame_sink *xs,
                     enum xrt_fs_capture_type capture_type,
@@ -458,7 +465,7 @@ uvc_fs_stream_start(struct xrt_fs *xfs,
 	ret = libusb_set_interface_alt_setting(stream->devh, 1, stream->alt_setting);
 	if (ret) {
 		UVC_ERROR(stream, "Failed to set interface alt setting %d", stream->alt_setting);
-		return false;
+		return XRT_ERROR_USB_COMMAND_FAILED;
 	}
 
 	stream->is_running = true;
@@ -491,12 +498,12 @@ uvc_fs_stream_start(struct xrt_fs *xfs,
 			stream->active_transfers = i;
 
 			uvc_fs_stream_stop((struct xrt_fs *)stream);
-			return false;
+			return XRT_ERROR_USB_COMMAND_FAILED;
 		}
 	}
 
 	stream->active_transfers = stream->num_transfers;
-	return true;
+	return XRT_SUCCESS;
 }
 
 static void
@@ -545,6 +552,7 @@ uvc_fs_create(libusb_context *usb_ctx,
 
 	struct uvc_fs *stream = U_TYPED_CALLOC(struct uvc_fs);
 	stream->log_level = debug_get_log_option_uvc_log();
+	u_frameserver_populate_function_pointers(&stream->base);
 	stream->base.enumerate_modes = uvc_fs_enumerate_modes;
 	stream->base.configure_capture = uvc_fs_configure_capture;
 	stream->base.stream_start = uvc_fs_stream_start;
@@ -664,9 +672,11 @@ uvc_fs_create(libusb_context *usb_ctx,
 		libusb_set_iso_packet_lengths(stream->transfer[i], packet_size);
 	}
 
-	stream->mode = (struct xrt_fs_mode){.format = stream->parameters.format,
-	                                    .width = stream->parameters.width,
-	                                    .height = stream->parameters.height};
+	stream->mode = (struct xrt_fs_mode){
+	    .format = stream->parameters.format,
+	    .width = stream->parameters.width,
+	    .height = stream->parameters.height,
+	};
 
 	// It's now safe to add it to the context.
 	xrt_frame_context_add(xfctx, &stream->node);

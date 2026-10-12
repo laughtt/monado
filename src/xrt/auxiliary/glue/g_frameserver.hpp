@@ -11,6 +11,8 @@
 
 #include "xrt/xrt_frameserver.h"
 
+#include "util/u_frameserver.h"
+
 #include "g_catch_guard.hpp"
 #include "g_traits.hpp"
 
@@ -21,7 +23,7 @@ namespace xrt::util {
 
 /*!
  * Selects which optional functions that the @ref FrameServerBase wrapper
- * should set, functions not selected are left as NULL.
+ * should set.
  */
 struct FrameServerFunctions
 {
@@ -54,6 +56,8 @@ public: // Methods
 
 		auto &xfs = *getXFS();
 
+		u_frameserver_populate_function_pointers(&xfs);
+
 		xfs.enumerate_modes = enumerateModesWrap;
 		xfs.configure_capture = configureCaptureWrap;
 		xfs.stream_start = streamStartWrap;
@@ -62,8 +66,6 @@ public: // Methods
 
 		if constexpr (functions.slam) {
 			xfs.slam_stream_start = slamStreamStartWrap;
-		} else {
-			xfs.slam_stream_start = [](struct xrt_fs *xfs, struct xrt_slam_sinks *sinks) { return false; };
 		}
 	}
 
@@ -120,21 +122,21 @@ private: // Functions
 // Not `->derived()`, that is ambiguous when T has more than one glue base.
 #define GET(xfs) (*fromXFS(xfs))
 
-	static bool
+	static xrt_result_t
 	enumerateModesWrap(struct xrt_fs *xfs, struct xrt_fs_mode **out_modes, uint32_t *out_count) noexcept
 	try {
 		return GET(xfs).enumerateModes(out_modes, out_count);
 	}
-	G_CATCH_GUARDS_WITH_RETURN(false)
+	G_CATCH_GUARDS_WITH_RETURN(XRT_ERROR_UNCAUGHT_EXCEPTION)
 
-	static bool
+	static xrt_result_t
 	configureCaptureWrap(struct xrt_fs *xfs, struct xrt_fs_capture_parameters *cp) noexcept
 	try {
 		return GET(xfs).configureCapture(cp);
 	}
-	G_CATCH_GUARDS_WITH_RETURN(false)
+	G_CATCH_GUARDS_WITH_RETURN(XRT_ERROR_UNCAUGHT_EXCEPTION)
 
-	static bool
+	static xrt_result_t
 	streamStartWrap(struct xrt_fs *xfs,
 	                struct xrt_frame_sink *xs,
 	                enum xrt_fs_capture_type capture_type,
@@ -142,28 +144,28 @@ private: // Functions
 	try {
 		return GET(xfs).streamStart(xs, capture_type, descriptor_index);
 	}
-	G_CATCH_GUARDS_WITH_RETURN(false)
+	G_CATCH_GUARDS_WITH_RETURN(XRT_ERROR_UNCAUGHT_EXCEPTION)
 
-	static bool
+	static xrt_result_t
 	slamStreamStartWrap(struct xrt_fs *xfs, struct xrt_slam_sinks *sinks) noexcept
 	try {
 		return GET(xfs).slamStreamStart(sinks);
 	}
-	G_CATCH_GUARDS_WITH_RETURN(false)
+	G_CATCH_GUARDS_WITH_RETURN(XRT_ERROR_UNCAUGHT_EXCEPTION)
 
-	static bool
+	static xrt_result_t
 	streamStopWrap(struct xrt_fs *xfs) noexcept
 	try {
 		return GET(xfs).streamStop();
 	}
-	G_CATCH_GUARDS_WITH_RETURN(false)
+	G_CATCH_GUARDS_WITH_RETURN(XRT_ERROR_UNCAUGHT_EXCEPTION)
 
-	static bool
-	isRunningWrap(struct xrt_fs *xfs) noexcept
+	static xrt_result_t
+	isRunningWrap(struct xrt_fs *xfs, bool *out_is_running) noexcept
 	try {
-		return GET(xfs).isRunning();
+		return GET(xfs).isRunning(*out_is_running);
 	}
-	G_CATCH_GUARDS_WITH_RETURN(false)
+	G_CATCH_GUARDS_WITH_RETURN(XRT_ERROR_UNCAUGHT_EXCEPTION)
 
 #undef GET
 };
