@@ -114,14 +114,23 @@ if(XRT_BUILD_DRIVER_HDK)
 endif()
 
 if(XRT_BUILD_DRIVER_PIMAX)
-	# libpimax (hidraw wake/keepalive/IMU library) is compiled straight into the driver.
+	# libpimax (hidraw wake/keepalive/IMU library). Default: the C sources are compiled straight into the driver.
+	# -DPIMAX_USE_RUST_LIBPIMAX=ON links the Rust port (rust/pimax-capi, identical C ABI) instead:
+	#   (cd ~/pimax-re/rust && cargo build --release -p pimax-capi)
 	set(PIMAX_LIBPIMAX_DIR "$ENV{HOME}/omarchyvr/libpimax" CACHE PATH "Path to libpimax")
+	option(PIMAX_USE_RUST_LIBPIMAX "Link libpimax_capi.a (Rust) instead of compiling libpimax/src/*.c" OFF)
+	set(PIMAX_RUST_TARGET_DIR "$ENV{HOME}/omarchyvr/rust/target/release" CACHE PATH "Directory with libpimax_capi.a")
 	find_package(Threads REQUIRED)
-	add_library(
-		drv_pimax STATIC
+	set(PIMAX_DRIVER_SOURCES
 		pimax/pimax_hmd.c pimax/pimax_lens.c pimax/pimax_lens.h pimax/pimax_interface.h pimax/pimax_prober.c pimax/pimax_ctrl.c pimax/pimax_ctrl.h
-		${PIMAX_LIBPIMAX_DIR}/src/pimax.c ${PIMAX_LIBPIMAX_DIR}/src/decode.c
 		)
+	if(PIMAX_USE_RUST_LIBPIMAX)
+		add_library(drv_pimax STATIC ${PIMAX_DRIVER_SOURCES})
+		# native-static-libs reported by rustc for the staticlib: -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc
+		target_link_libraries(drv_pimax PRIVATE ${PIMAX_RUST_TARGET_DIR}/libpimax_capi.a ${CMAKE_DL_LIBS} m rt util Threads::Threads)
+	else()
+		add_library(drv_pimax STATIC ${PIMAX_DRIVER_SOURCES} ${PIMAX_LIBPIMAX_DIR}/src/pimax.c ${PIMAX_LIBPIMAX_DIR}/src/decode.c)
+	endif()
 	target_include_directories(drv_pimax PRIVATE ${PIMAX_LIBPIMAX_DIR}/include)
 	target_link_libraries(drv_pimax PRIVATE xrt-interfaces aux_util aux_math Threads::Threads)
 	list(APPEND ENABLED_HEADSET_DRIVERS pimax)
