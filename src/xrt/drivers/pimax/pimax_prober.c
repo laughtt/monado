@@ -23,11 +23,18 @@ pimax_found(struct xrt_prober *xp,
 		return 0;
 	}
 
-	struct xrt_device *xdev = pimax_hmd_create();
+	struct xrt_device *ctrls[2] = {NULL, NULL};
+	struct xrt_device *xdev = pimax_hmd_create(ctrls);
 	if (xdev == NULL) {
 		return -1;
 	}
 	created = true;
 	out_xdev[0] = xdev;
-	return 1;
+	int n = 1;
+	for (int i = 0; i < 2; i++) {
+		if (ctrls[i] != NULL) {
+			out_xdev[n++] = ctrls[i];
+		}
+	}
+	return n;
 }

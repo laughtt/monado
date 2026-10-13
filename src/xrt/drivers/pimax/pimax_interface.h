@@ -36,9 +36,9 @@ pimax_found(struct xrt_prober *xp,
             cJSON *attached_data,
             struct xrt_device **out_xdev);
 
-/*! Create the HMD (opens libpimax session). */
+/*! Create the HMD (opens libpimax session). out_ctrls[2] receives left/right controllers (NULL if none). */
 struct xrt_device *
-pimax_hmd_create(void);
+pimax_hmd_create(struct xrt_device *out_ctrls[2]);
 
 #ifdef __cplusplus
 }

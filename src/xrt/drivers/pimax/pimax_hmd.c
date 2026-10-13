@@ -34,6 +34,7 @@
 #include "pimax.h"
 #include "pimax_interface.h"
 #include "pimax_lens.h"
+#include "pimax_ctrl.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -71,6 +72,10 @@ struct pimax_hmd
 
 	int axis_mode;
 	struct pimax_lens lens;
+
+	struct pimax_ctrl_ctx *ctrl;
+	struct xrt_device *ctrl_devs[2];
+	bool ctrl_handed_out;
 
 	// Device clock -> monotonic clock.
 	bool have_clock;
@@ -182,6 +187,24 @@ bias_finish(struct pimax_hmd *hmd)
 
 //! Runs on the libpimax session thread.
 static void
+pimax_on_controller(void *user, const pimax_controller_report *r)
+{
+	pimax_ctrl_on_report(((struct pimax_hmd *)user)->ctrl, r);
+}
+
+static void
+pimax_on_controller_status(void *user, const pimax_controller_status *s)
+{
+	pimax_ctrl_on_status(((struct pimax_hmd *)user)->ctrl, s);
+}
+
+static void
+pimax_on_state(void *user, pimax_state state)
+{
+	pimax_ctrl_on_state(((struct pimax_hmd *)user)->ctrl, state);
+}
+
+static void
 pimax_on_imu(void *user, const pimax_imu_sample *s)
 {
 	struct pimax_hmd *hmd = (struct pimax_hmd *)user;
@@ -255,7 +278,15 @@ pimax_hmd_destroy(struct xrt_device *xdev)
 {
 	struct pimax_hmd *hmd = pimax_hmd(xdev);
 
-	// Stop the session thread (and with it the IMU callback) before freeing anything.
+	// Stop the controller attach thread, then the session thread (and with it the callbacks) before freeing anything.
+	if (hmd->ctrl != NULL) {
+		pimax_ctrl_stop(hmd->ctrl);
+		if (!hmd->ctrl_handed_out) {
+			// Creation failed after the controllers were made: nobody else will destroy them.
+			xrt_device_destroy(&hmd->ctrl_devs[0]);
+			xrt_device_destroy(&hmd->ctrl_devs[1]);
+		}
+	}
 	if (hmd->lib != NULL) {
 		pimax_close(hmd->lib);
 		hmd->lib = NULL;
@@ -330,7 +361,7 @@ pimax_hmd_compute_distortion(struct xrt_device *xdev, uint32_t view, float u, fl
 }
 
 struct xrt_device *
-pimax_hmd_create(void)
+pimax_hmd_create(struct xrt_device *out_ctrls[2])
 {
 	enum u_device_alloc_flags flags =
 	    (enum u_device_alloc_flags)(U_DEVICE_ALLOC_HMD | U_DEVICE_ALLOC_TRACKING_NONE);
@@ -441,7 +472,16 @@ pimax_hmd_create(void)
 
 	bias_restart(hmd);
 
-	pimax_callbacks cb = {.user = hmd, .on_imu = pimax_on_imu};
+	hmd->ctrl = pimax_ctrl_create(&hmd->base, hmd->log_level, hmd->ctrl_devs);
+	if (hmd->ctrl == NULL) {
+		HMD_WARN(hmd, "controllers not created");
+	}
+
+	pimax_callbacks cb = {.user = hmd,
+	                      .on_imu = pimax_on_imu,
+	                      .on_state = pimax_on_state,
+	                      .on_controller = pimax_on_controller,
+	                      .on_controller_status = pimax_on_controller_status};
 	hmd->lib = pimax_open(&cb);
 	if (hmd->lib == NULL) {
 		HMD_ERROR(hmd, "pimax_open failed");
@@ -471,6 +511,13 @@ pimax_hmd_create(void)
 		} else {
 			HMD_WARN(hmd, "could not write %s", path);
 		}
+	}
+
+	if (hmd->ctrl != NULL) {
+		pimax_ctrl_start(hmd->ctrl, hmd->lib);
+		out_ctrls[0] = hmd->ctrl_devs[0];
+		out_ctrls[1] = hmd->ctrl_devs[1];
+		hmd->ctrl_handed_out = true;
 	}
 
 	u_var_add_root(hmd, "Pimax Dream Air", true);

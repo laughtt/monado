@@ -119,7 +119,7 @@ if(XRT_BUILD_DRIVER_PIMAX)
 	find_package(Threads REQUIRED)
 	add_library(
 		drv_pimax STATIC
-		pimax/pimax_hmd.c pimax/pimax_lens.c pimax/pimax_lens.h pimax/pimax_interface.h pimax/pimax_prober.c
+		pimax/pimax_hmd.c pimax/pimax_lens.c pimax/pimax_lens.h pimax/pimax_interface.h pimax/pimax_prober.c pimax/pimax_ctrl.c pimax/pimax_ctrl.h
 		${PIMAX_LIBPIMAX_DIR}/src/pimax.c ${PIMAX_LIBPIMAX_DIR}/src/decode.c
 		)
 	target_include_directories(drv_pimax PRIVATE ${PIMAX_LIBPIMAX_DIR}/include)
