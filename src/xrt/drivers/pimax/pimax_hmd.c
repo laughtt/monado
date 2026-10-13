@@ -19,6 +19,7 @@
 #include "math/m_imu_3dof.h"
 #include "math/m_api.h"
 #include "math/m_vec3.h"
+#include "math/m_matrix_2x2.h"
 #include "math/m_mathinclude.h"
 
 #include "util/u_debug.h"
@@ -39,8 +40,14 @@
 
 DEBUG_GET_ONCE_LOG_OPTION(pimax_log, "PIMAX_LOG", U_LOGGING_INFO)
 //! TODO: the panels are mounted rotated by 90 deg (direction unknown). 0, 90, 180 or 270.
-DEBUG_GET_ONCE_NUM_OPTION(pimax_panel_rotation, "PIMAX_PANEL_ROTATION", 0)
+DEBUG_GET_ONCE_NUM_OPTION(pimax_panel_rotation, "PIMAX_PANEL_ROTATION", 0) // legacy: both eyes
+DEBUG_GET_ONCE_NUM_OPTION(pimax_rot_left, "PIMAX_ROT_LEFT", 90)
+DEBUG_GET_ONCE_NUM_OPTION(pimax_rot_right, "PIMAX_ROT_RIGHT", 270)
+DEBUG_GET_ONCE_BOOL_OPTION(pimax_mirror_left, "PIMAX_MIRROR_LEFT", false)
+DEBUG_GET_ONCE_BOOL_OPTION(pimax_mirror_right, "PIMAX_MIRROR_RIGHT", false)
 //! 0: sensor axes == OpenXR axes (+X right, +Y up, -Z fwd). 1: 180 deg about Y (X and Z flipped).
+//! Debug only: divide screen/view sizes so the windowed (XCB/Wayland) window fits a normal monitor.
+DEBUG_GET_ONCE_NUM_OPTION(pimax_debug_div, "PIMAX_DEBUG_DIV", 1)
 DEBUG_GET_ONCE_NUM_OPTION(pimax_axis_mode, "PIMAX_AXIS_MODE", 1)
 DEBUG_GET_ONCE_NUM_OPTION(pimax_bias_ms, "PIMAX_BIAS_MS", 2000)
 
@@ -345,8 +352,13 @@ pimax_hmd_create(void)
 
 	// Display: one 7104x3840 @ 72 Hz output, left half = left eye, right half = right eye.
 	hmd->base.hmd->screens[0].nominal_frame_interval_ns = time_s_to_ns(1.0f / PIMAX_REFRESH_HZ);
-	hmd->base.hmd->screens[0].w_pixels = PIMAX_EYE_W * 2;
-	hmd->base.hmd->screens[0].h_pixels = PIMAX_EYE_H;
+	long div = debug_get_num_option_pimax_debug_div();
+	if (div < 1) {
+		div = 1;
+	}
+	const uint32_t eye_w = PIMAX_EYE_W / div, eye_h = PIMAX_EYE_H / div;
+	hmd->base.hmd->screens[0].w_pixels = eye_w * 2;
+	hmd->base.hmd->screens[0].h_pixels = eye_h;
 
 	// Simple symmetric FOV, no lens data yet (doc: ~98 x 87 deg max).
 	const double hFOV = 98.0 * (M_PI / 180.0);
@@ -359,26 +371,45 @@ pimax_hmd_create(void)
 	}
 
 	/*
-	 * TODO(panel rotation): each eye panel is mounted rotated by 90 deg, direction unknown. PIMAX_PANEL_ROTATION
-	 * selects the compositor rotation (0 default). For 90/270 the per-eye panel dims would be swapped
-	 * (3840x3552) and the viewport layout needs re-checking on hardware.
+	 * Panels are mounted rotated by 90 deg and mirror-symmetric: the left panel shows its half of the frame
+	 * rotated 90 deg counter-clockwise, the right panel 90 deg clockwise. The compositor pre-rotates each eye the
+	 * opposite way (u_device_rotation_*: "right" = 90 cw, "left" = 90 ccw as applied to the image).
+	 * PIMAX_ROT_LEFT / PIMAX_ROT_RIGHT select 0/90/180/270 (degrees of pre-rotation, clockwise), optional
+	 * PIMAX_MIRROR_LEFT / PIMAX_MIRROR_RIGHT flip the pre-rotated image horizontally.
+	 * With 90/270 the user-facing display is eye_h x eye_w (3840x3552) while the framebuffer viewport stays
+	 * eye_w x eye_h (3552x3840).
 	 */
-	long rot = debug_get_num_option_pimax_panel_rotation();
-	const struct xrt_matrix_2x2 *rotm = &u_device_rotation_ident;
-	switch (rot) {
-	case 90: rotm = &u_device_rotation_right; break;
-	case 180: rotm = &u_device_rotation_180; break;
-	case 270: rotm = &u_device_rotation_left; break;
-	default: break;
+	long rots[2] = {debug_get_num_option_pimax_rot_left(), debug_get_num_option_pimax_rot_right()};
+	long legacy = debug_get_num_option_pimax_panel_rotation();
+	if (legacy != 0) {
+		rots[0] = rots[1] = legacy;
 	}
+	bool mirror[2] = {debug_get_bool_option_pimax_mirror_left(), debug_get_bool_option_pimax_mirror_right()};
 	for (uint8_t eye = 0; eye < 2; ++eye) {
-		hmd->base.hmd->views[eye].display.w_pixels = PIMAX_EYE_W;
-		hmd->base.hmd->views[eye].display.h_pixels = PIMAX_EYE_H;
-		hmd->base.hmd->views[eye].viewport.x_pixels = eye * PIMAX_EYE_W;
+		const struct xrt_matrix_2x2 *rotm = &u_device_rotation_ident;
+		long r = ((rots[eye] % 360) + 360) % 360;
+		switch (r) {
+		case 90: rotm = &u_device_rotation_right; break;
+		case 180: rotm = &u_device_rotation_180; break;
+		case 270: rotm = &u_device_rotation_left; break;
+		default: r = 0; break;
+		}
+		bool swap = (r == 90 || r == 270);
+		hmd->base.hmd->views[eye].display.w_pixels = swap ? eye_h : eye_w;
+		hmd->base.hmd->views[eye].display.h_pixels = swap ? eye_w : eye_h;
+		hmd->base.hmd->views[eye].viewport.x_pixels = eye * eye_w;
 		hmd->base.hmd->views[eye].viewport.y_pixels = 0;
-		hmd->base.hmd->views[eye].viewport.w_pixels = PIMAX_EYE_W;
-		hmd->base.hmd->views[eye].viewport.h_pixels = PIMAX_EYE_H;
-		hmd->base.hmd->views[eye].rot = *rotm;
+		hmd->base.hmd->views[eye].viewport.w_pixels = eye_w;
+		hmd->base.hmd->views[eye].viewport.h_pixels = eye_h;
+		struct xrt_matrix_2x2 m = *rotm;
+		if (mirror[eye]) {
+			const struct xrt_matrix_2x2 flip = {{.vecs = {{-1, 0}, {0, 1}}}};
+			m_mat2x2_multiply(&m, &flip, &m);
+		}
+		hmd->base.hmd->views[eye].rot = m;
+		HMD_INFO(hmd, "eye %u: pre-rotate %ld deg%s, display %ux%u, viewport %ux%u", eye, r,
+		         mirror[eye] ? " + mirror" : "", hmd->base.hmd->views[eye].display.w_pixels,
+		         hmd->base.hmd->views[eye].display.h_pixels, eye_w, eye_h);
 	}
 
 	// TODO: real lens distortion (Dream Air tables are GPL, must be re-measured).
@@ -432,7 +463,7 @@ pimax_hmd_create(void)
 	u_var_add_f32(hmd, &hmd->bias_dps[1], "bias y dps");
 	u_var_add_f32(hmd, &hmd->bias_dps[2], "bias z dps");
 
-	HMD_INFO(hmd, "Pimax Dream Air up: keep the headset still for %u ms for gyro calibration (axis mode %d, panel rot %ld)",
-	         hmd->bias_target, hmd->axis_mode, rot);
+	HMD_INFO(hmd, "Pimax Dream Air up: keep the headset still for %u ms for gyro calibration (axis mode %d)",
+	         hmd->bias_target, hmd->axis_mode);
 	return &hmd->base;
 }
