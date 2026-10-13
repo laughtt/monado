@@ -9,6 +9,12 @@
  * PIMAX_CTRL_POSE=imu: same position, orientation from the controller IMU (accel 1024 LSB/g, gyro scale is a guess,
  * PIMAX_CTRL_GYRO_LSB_DPS, default 16.4, axes assumed == OpenXR axes).
  *
+ * Hand tracking (XR_EXT_hand_tracking, data source CONTROLLER): the finger curls come from the Rust crate pimax-hands
+ * (trigger -> index, grip -> middle/ring/little, touch bits -> thumb; filters + thumb state machine live there), this
+ * file only feeds it the decoded reports and runs Monado's u_hand_sim_simulate_generic on the result. The hand is
+ * posed from the controller's grip pose through a fixed grip->wrist offset (also from pimax-hands).
+ * PIMAX_CTRL_HANDS=0 turns it off, PIMAX_CTRL_HANDS_DEMO=1 replaces the reports by a scripted pattern (test aid).
+ *
  * @ingroup drv_pimax
  */
 
@@ -22,14 +28,17 @@
 #include "math/m_imu_3dof.h"
 #include "math/m_vec3.h"
 #include "math/m_mathinclude.h"
+#include "math/m_space.h"
 
 #include "util/u_debug.h"
 #include "util/u_device.h"
+#include "util/u_hand_simulation.h"
 #include "util/u_logging.h"
 #include "util/u_misc.h"
 #include "util/u_var.h"
 
 #include "pimax_ctrl.h"
+#include "pimax_hands.h"
 
 #include <math.h>
 #include <pthread.h>
@@ -40,6 +49,8 @@
 
 DEBUG_GET_ONCE_OPTION(pimax_ctrl_pose, "PIMAX_CTRL_POSE", "fixed")
 DEBUG_GET_ONCE_FLOAT_OPTION(pimax_ctrl_gyro_lsb_dps, "PIMAX_CTRL_GYRO_LSB_DPS", 16.4f)
+DEBUG_GET_ONCE_BOOL_OPTION(pimax_ctrl_hands, "PIMAX_CTRL_HANDS", true)
+DEBUG_GET_ONCE_BOOL_OPTION(pimax_ctrl_hands_demo, "PIMAX_CTRL_HANDS_DEMO", false)
 
 // Fixed offsets in the head-yaw frame (x right, y up, -z forward).
 #define OFF_SIDE 0.20f
@@ -65,6 +76,7 @@ enum
 	I_STICK,
 	I_GRIP_POSE,
 	I_AIM_POSE,
+	I_HAND_TRACKING, // XRT_INPUT_HT_CONFORMING_*; last, only allocated when hand tracking is on
 	I_COUNT,
 };
 
@@ -75,6 +87,8 @@ struct pimax_ctrl_ctx
 	enum u_logging_level log_level;
 	bool imu_mode;
 	float gyro_scale; // rad/s per LSB
+	bool hands;       // controller-driven hand tracking (pimax-hands)
+	bool hands_demo;  // scripted input instead of reports (PIMAX_CTRL_HANDS_DEMO)
 
 	struct pimax_controller *ctl[2]; // [0] left (slot 2), [1] right (slot 3)
 
@@ -102,6 +116,11 @@ struct pimax_controller
 	float trigger, grip, stick_x, stick_y;
 	bool btn_a, btn_b, btn_menu, btn_stick, t_a, t_b, t_stick;
 	uint8_t raw46;
+
+	// Hand tracking (lock): Rust state (curl filters, thumb state machine) and its latest result.
+	pimax_hands *hands;
+	pimax_hands_out hands_out;
+	struct xrt_pose grip_to_wrist; // wrist in the grip pose frame
 
 	// IMU orientation (lock).
 	struct m_imu_3dof fusion;
@@ -215,6 +234,11 @@ pimax_ctl_destroy(struct xrt_device *xdev)
 	if (c->fusion_init) {
 		m_imu_3dof_close(&c->fusion);
 	}
+	pthread_mutex_lock(&c->lock);
+	pimax_hands *hands = c->hands; // a late report must not find a freed hand state
+	c->hands = NULL;
+	pthread_mutex_unlock(&c->lock);
+	pimax_hands_destroy(hands);
 	pthread_mutex_destroy(&c->lock);
 	u_device_free(&c->base);
 	ctx_unref(ctx);
@@ -319,6 +343,70 @@ pimax_ctl_get_tracked_pose(struct xrt_device *xdev,
 	                                                     XRT_SPACE_RELATION_POSITION_VALID_BIT |
 	                                                     XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT);
 	*out_relation = rel;
+	return XRT_SUCCESS;
+}
+
+//! Fill the joint set of this hand from the Rust curl state; the hand follows the grip pose.
+static xrt_result_t
+pimax_ctl_get_hand_tracking(struct xrt_device *xdev,
+                            enum xrt_input_name name,
+                            int64_t at_timestamp_ns,
+                            struct xrt_hand_joint_set *out_value,
+                            int64_t *out_timestamp_ns)
+{
+	struct pimax_controller *c = ctl(xdev);
+	bool left = c->index == 0;
+	if (name != (left ? XRT_INPUT_HT_CONFORMING_LEFT : XRT_INPUT_HT_CONFORMING_RIGHT)) {
+		U_LOG_XDEV_UNSUPPORTED_INPUT(&c->base, c->ctx->log_level, name);
+		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
+
+	uint64_t now = os_monotonic_get_ns();
+	pimax_hands_out ho;
+	pthread_mutex_lock(&c->lock);
+	bool active = c->have_report && (now - c->last_report_ns) < ACTIVE_TIMEOUT_NS;
+	if (c->ctx->hands_demo) {
+		// Scripted input instead of reports; always "active" so a test needs no awake controller.
+		pimax_hands_input demo;
+		pimax_hands_demo_input(now, !left, &demo);
+		pimax_hands_update(c->hands, now, &demo);
+		pimax_hands_get(c->hands, &c->hands_out);
+		active = true;
+	}
+	ho = c->hands_out;
+	pthread_mutex_unlock(&c->lock);
+
+	// Wrist = grip pose * fixed offset (the joint set is expressed relative to its hand_pose, in tracking-origin space).
+	struct xrt_space_relation grip = XRT_SPACE_RELATION_ZERO;
+	xrt_result_t xret = pimax_ctl_get_tracked_pose(xdev, XRT_INPUT_TOUCH_GRIP_POSE, at_timestamp_ns, &grip);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	struct xrt_relation_chain chain = {0};
+	m_relation_chain_push_pose(&chain, &c->grip_to_wrist);
+	m_relation_chain_push_relation(&chain, &grip);
+	struct xrt_space_relation wrist = XRT_SPACE_RELATION_ZERO;
+	m_relation_chain_resolve(&chain, &wrist);
+
+	// Same order as struct u_hand_tracking_values.
+	const pimax_hands_finger *src[5] = {&ho.little, &ho.ring, &ho.middle, &ho.index, &ho.thumb};
+	struct u_hand_tracking_values values;
+	struct u_hand_tracking_finger_value *dst[5] = {&values.little, &values.ring, &values.middle, &values.index,
+	                                               &values.thumb};
+	for (int f = 0; f < 5; f++) {
+		dst[f]->splay = src[f]->splay;
+		for (int j = 0; j < 4; j++) {
+			dst[f]->joint_curls[j] = src[f]->joint_curls[j];
+		}
+		dst[f]->joint_count = 4;
+	}
+
+	u_hand_sim_simulate_generic(&values, left ? XRT_HAND_LEFT : XRT_HAND_RIGHT, &wrist, out_value);
+
+	// The simulation marks the hand pose fully tracked; keep the real flags of the (synthesized) grip pose.
+	out_value->hand_pose = wrist;
+	out_value->is_active = active;
+	*out_timestamp_ns = at_timestamp_ns;
 	return XRT_SUCCESS;
 }
 
@@ -430,6 +518,11 @@ pimax_ctrl_on_report(struct pimax_ctrl_ctx *ctx, const pimax_controller_report *
 	c->t_b = (r->touch & 0x02) != 0;
 	c->t_stick = (r->touch & PIMAX_TOUCH_STICK) != 0;
 	c->raw46 = r->raw[46];
+	if (c->hands != NULL && !ctx->hands_demo) {
+		// Bit meanings (touch, buttons), normalisation, filters and the thumb state machine are all in Rust.
+		pimax_hands_update_report(c->hands, now, r->trigger, r->grip, r->stick_x, r->stick_y, r->buttons, r->touch);
+		pimax_hands_get(c->hands, &c->hands_out);
+	}
 	if (ctx->imu_mode) {
 		imu_update(c, r, now);
 	}
@@ -543,7 +636,10 @@ static struct pimax_controller *
 ctl_create(struct pimax_ctrl_ctx *ctx, int index)
 {
 	bool left = index == 0;
-	struct pimax_controller *c = U_DEVICE_ALLOCATE(struct pimax_controller, U_DEVICE_ALLOC_TRACKING_NONE, I_COUNT, 1);
+	// The hand tracking input is the last one; leave it out when hand tracking is off.
+	const int input_count = ctx->hands ? I_COUNT : I_HAND_TRACKING;
+	struct pimax_controller *c =
+	    U_DEVICE_ALLOCATE(struct pimax_controller, U_DEVICE_ALLOC_TRACKING_NONE, input_count, 1);
 	if (c == NULL) {
 		return NULL;
 	}
@@ -568,7 +664,7 @@ ctl_create(struct pimax_ctrl_ctx *ctx, int index)
 	in[I_STICK].name = XRT_INPUT_TOUCH_THUMBSTICK;
 	in[I_GRIP_POSE].name = XRT_INPUT_TOUCH_GRIP_POSE;
 	in[I_AIM_POSE].name = XRT_INPUT_TOUCH_AIM_POSE;
-	for (int i = 0; i < I_COUNT; i++) {
+	for (int i = 0; i < input_count; i++) {
 		in[i].active = (i >= I_GRIP_POSE);
 	}
 	c->base.outputs[0].name = XRT_OUTPUT_NAME_TOUCH_HAPTIC;
@@ -590,6 +686,26 @@ ctl_create(struct pimax_ctrl_ctx *ctx, int index)
 	c->base.supported.position_tracking = false;
 	c->base.supported.battery_status = true;
 
+	if (ctx->hands) {
+		c->hands = pimax_hands_create();
+		if (c->hands == NULL) {
+			U_LOG_IFL_E(ctx->log_level, "pimax-hands: out of memory, hand tracking off for this controller");
+			c->base.input_count = I_HAND_TRACKING; // drop the unused hand tracking input
+		}
+	}
+	if (c->hands != NULL) {
+		pimax_hands_get(c->hands, &c->hands_out);
+		pimax_hands_pose p;
+		pimax_hands_grip_to_wrist(left ? 0 : 1, &p);
+		c->grip_to_wrist.orientation = (struct xrt_quat){p.orientation[0], p.orientation[1], p.orientation[2],
+		                                                  p.orientation[3]};
+		c->grip_to_wrist.position = (struct xrt_vec3){p.position[0], p.position[1], p.position[2]};
+		in[I_HAND_TRACKING].name = left ? XRT_INPUT_HT_CONFORMING_LEFT : XRT_INPUT_HT_CONFORMING_RIGHT;
+		in[I_HAND_TRACKING].active = true;
+		c->base.get_hand_tracking = pimax_ctl_get_hand_tracking;
+		c->base.supported.hand_tracking = true;
+	}
+
 	c->base.update_inputs = pimax_ctl_update_inputs;
 	c->base.get_tracked_pose = pimax_ctl_get_tracked_pose;
 	c->base.set_output = pimax_ctl_set_output;
@@ -604,7 +720,18 @@ ctl_create(struct pimax_ctrl_ctx *ctx, int index)
 	u_var_add_bool(c, &c->btn_a, "A/X");
 	u_var_add_bool(c, &c->btn_b, "B/Y");
 	u_var_add_bool(c, &c->btn_menu, "menu");
+	if (c->hands != NULL) {
+		u_var_add_ro_f32(c, &c->hands_out.curl[3], "hand: index curl");
+		u_var_add_ro_f32(c, &c->hands_out.curl[2], "hand: middle curl");
+		u_var_add_ro_f32(c, &c->hands_out.curl[4], "hand: thumb curl");
+	}
 	return c;
+}
+
+bool
+pimax_ctrl_demo_enabled(void)
+{
+	return debug_get_bool_option_pimax_ctrl_hands() && debug_get_bool_option_pimax_ctrl_hands_demo();
 }
 
 struct pimax_ctrl_ctx *
@@ -621,6 +748,13 @@ pimax_ctrl_create(struct xrt_device *head, enum u_logging_level log_level, struc
 	ctx->imu_mode = mode != NULL && strcmp(mode, "imu") == 0;
 	float lsb = debug_get_float_option_pimax_ctrl_gyro_lsb_dps();
 	ctx->gyro_scale = (float)(M_PI / 180.0) / (lsb > 0.0f ? lsb : 16.4f);
+	ctx->hands = debug_get_bool_option_pimax_ctrl_hands();
+	ctx->hands_demo = ctx->hands && debug_get_bool_option_pimax_ctrl_hands_demo();
+	if (ctx->hands && pimax_hands_abi_version() != PIMAX_HANDS_ABI_VERSION) {
+		U_LOG_IFL_E(log_level, "pimax-hands ABI %u != header %u: stale libpimax_capi.a, hand tracking off",
+		            pimax_hands_abi_version(), PIMAX_HANDS_ABI_VERSION);
+		ctx->hands = ctx->hands_demo = false;
+	}
 
 	for (int i = 0; i < 2; i++) {
 		ctx->ctl[i] = ctl_create(ctx, i);
@@ -630,7 +764,8 @@ pimax_ctrl_create(struct xrt_device *head, enum u_logging_level log_level, struc
 		}
 		out_devs[i] = &ctx->ctl[i]->base;
 	}
-	U_LOG_IFL_I(log_level, "Pimax controllers: pose mode %s%s", ctx->imu_mode ? "imu" : "fixed",
-	            ctx->imu_mode ? " (gyro scale is a guess)" : "");
+	U_LOG_IFL_I(log_level, "Pimax controllers: pose mode %s%s, hand tracking %s", ctx->imu_mode ? "imu" : "fixed",
+	            ctx->imu_mode ? " (gyro scale is a guess)" : "",
+	            ctx->hands ? (ctx->hands_demo ? "on (DEMO pattern)" : "on (data source: controller)") : "off");
 	return ctx;
 }

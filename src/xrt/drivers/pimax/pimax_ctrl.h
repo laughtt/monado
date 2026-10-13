@@ -23,6 +23,10 @@ struct pimax_ctrl_ctx;
 struct pimax_ctrl_ctx *
 pimax_ctrl_create(struct xrt_device *head, enum u_logging_level log_level, struct xrt_device *out_devs[2]);
 
+/*! True if PIMAX_CTRL_HANDS_DEMO=1 (and hand tracking is on): scripted hand input for tests without a human. */
+bool
+pimax_ctrl_demo_enabled(void);
+
 /*! Start the attach thread (burst on start, re-send on a 0x37 heartbeat without reports). Uses the HMD's session. */
 void
 pimax_ctrl_start(struct pimax_ctrl_ctx *ctx, pimax_t *lib);
