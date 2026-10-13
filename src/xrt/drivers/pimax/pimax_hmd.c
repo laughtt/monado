@@ -53,7 +53,8 @@ DEBUG_GET_ONCE_NUM_OPTION(pimax_bias_ms, "PIMAX_BIAS_MS", 2000)
 
 #define PIMAX_EYE_W 3552
 #define PIMAX_EYE_H 3840
-#define PIMAX_REFRESH_HZ 72.0f
+//! Refresh rate: 72 (default) or 90. Must match the mode Monado picks (XRT_COMPOSITOR_DESIRED_MODE).
+DEBUG_GET_ONCE_NUM_OPTION(pimax_fps, "PIMAX_FPS", 72)
 #define PIMAX_PUSH_DIV 4 // push every 4th IMU sample (250 Hz) into the relation history
 
 struct pimax_hmd
@@ -351,7 +352,7 @@ pimax_hmd_create(void)
 	hmd->base.hmd->blend_mode_count = 1;
 
 	// Display: one 7104x3840 @ 72 Hz output, left half = left eye, right half = right eye.
-	hmd->base.hmd->screens[0].nominal_frame_interval_ns = time_s_to_ns(1.0f / PIMAX_REFRESH_HZ);
+	hmd->base.hmd->screens[0].nominal_frame_interval_ns = time_s_to_ns(1.0f / (float)debug_get_num_option_pimax_fps());
 	long div = debug_get_num_option_pimax_debug_div();
 	if (div < 1) {
 		div = 1;
@@ -440,17 +441,18 @@ pimax_hmd_create(void)
 
 	// Firmware only lights the panels after the video-prepare sequence and ~5.5 s of stable 72 Hz video.
 	// Also tell the keepalive service (pimax-keepalived) which rate to carry.
-	int prep = pimax_video_prepare(hmd->lib, 72);
-	HMD_INFO(hmd, "pimax_video_prepare(72) -> %d", prep);
+	long fps = debug_get_num_option_pimax_fps();
+	int prep = pimax_video_prepare(hmd->lib, (uint8_t)fps);
+	HMD_INFO(hmd, "pimax_video_prepare(%ld) -> %d", fps, prep);
 	const char *xdg = getenv("XDG_RUNTIME_DIR");
 	if (xdg != NULL) {
 		char path[512];
 		snprintf(path, sizeof(path), "%s/pimax-rate", xdg);
 		FILE *f = fopen(path, "w");
 		if (f != NULL) {
-			fputs("72\n", f);
+			fprintf(f, "%ld\n", fps);
 			fclose(f);
-			HMD_INFO(hmd, "wrote 72 to %s", path);
+			HMD_INFO(hmd, "wrote %ld to %s", fps, path);
 		} else {
 			HMD_WARN(hmd, "could not write %s", path);
 		}
