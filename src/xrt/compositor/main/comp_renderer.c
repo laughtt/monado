@@ -677,6 +677,12 @@ renderer_close_renderings_and_fences(struct comp_renderer *r)
 	// Fences
 	if (r->buffer_count > 0 && r->fences != NULL) {
 		for (uint32_t i = 0; i < r->buffer_count; i++) {
+			if (r->gpu_stuck && r->stuck_fence == r->fences[i]) {
+				// Never poll a destroyed fence: drop the stuck state (only on target loss / teardown).
+				COMP_ERROR(r->c, "Destroying the stuck frame fence (target lost or teardown while stuck).");
+				r->gpu_stuck = false;
+				r->stuck_fence = VK_NULL_HANDLE;
+			}
 			vk->vkDestroyFence(vk->device, r->fences[i], NULL);
 			r->fences[i] = VK_NULL_HANDLE;
 		}
