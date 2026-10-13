@@ -113,6 +113,20 @@ if(XRT_BUILD_DRIVER_HDK)
 	list(APPEND ENABLED_HEADSET_DRIVERS hdk)
 endif()
 
+if(XRT_BUILD_DRIVER_PIMAX)
+	# libpimax (hidraw wake/keepalive/IMU library) is compiled straight into the driver.
+	set(PIMAX_LIBPIMAX_DIR "$ENV{HOME}/omarchyvr/libpimax" CACHE PATH "Path to libpimax")
+	find_package(Threads REQUIRED)
+	add_library(
+		drv_pimax STATIC
+		pimax/pimax_hmd.c pimax/pimax_interface.h pimax/pimax_prober.c
+		${PIMAX_LIBPIMAX_DIR}/src/pimax.c ${PIMAX_LIBPIMAX_DIR}/src/decode.c
+		)
+	target_include_directories(drv_pimax PRIVATE ${PIMAX_LIBPIMAX_DIR}/include)
+	target_link_libraries(drv_pimax PRIVATE xrt-interfaces aux_util aux_math Threads::Threads)
+	list(APPEND ENABLED_HEADSET_DRIVERS pimax)
+endif()
+
 if(XRT_BUILD_DRIVER_HYDRA)
 	set(HYDRA_SOURCE_FILES)
 

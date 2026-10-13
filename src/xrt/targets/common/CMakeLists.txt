@@ -118,6 +118,10 @@ if(XRT_BUILD_DRIVER_HDK)
 	target_link_libraries(target_lists PRIVATE drv_hdk)
 endif()
 
+if(XRT_BUILD_DRIVER_PIMAX)
+	target_link_libraries(target_lists PRIVATE drv_pimax)
+endif()
+
 if(XRT_BUILD_DRIVER_HYDRA)
 	target_link_libraries(target_lists PRIVATE drv_hydra)
 endif()

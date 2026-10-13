@@ -32,6 +32,10 @@
 #include "hdk/hdk_interface.h"
 #endif
 
+#ifdef XRT_BUILD_DRIVER_PIMAX
+#include "pimax/pimax_interface.h"
+#endif
+
 #ifdef XRT_BUILD_DRIVER_OHMD
 #include "ohmd/oh_interface.h"
 #endif
@@ -218,6 +222,10 @@ struct xrt_prober_entry target_entry_list[] = {
 #ifdef XRT_BUILD_DRIVER_HDK
     {HDK_VID, HDK_PID, hdk_found, "OSVR HDK", "osvr"},
 #endif // XRT_BUILD_DRIVER_HDK
+
+#ifdef XRT_BUILD_DRIVER_PIMAX
+    {PIMAX_DRV_VID, PIMAX_DRV_PID, pimax_found, "Pimax Dream Air", "pimax"},
+#endif // XRT_BUILD_DRIVER_PIMAX
 
     {0x0000, 0x0000, NULL, NULL, NULL}, // Terminate
 };
