@@ -144,6 +144,9 @@ struct pimax_camera
 	int64_t win_start_ns;
 	uint64_t win_frames, win_tracking, win_ht_updates;
 	int64_t last_ht_ts;
+	//! Hand activity per stats window (PIMAX_HT_STATS=1): polls, active polls, last wrist in camera-0 space.
+	uint64_t win_polls, win_active[2];
+	struct xrt_vec3 last_wrist[2];
 	int64_t last_frame_ts;
 };
 
@@ -334,13 +337,25 @@ poll_mercury(struct pimax_camera *pc)
 		return;
 	}
 	// With HTA_PREDICTION_DISABLE=1 the async shim returns the timestamp of the last processed pair.
-	struct xrt_hand_joint_set set;
-	int64_t ts = 0;
-	if (xrt_device_get_hand_tracking(pc->ht_raw, XRT_INPUT_HT_UNOBSTRUCTED_LEFT, os_monotonic_get_ns(), &set,
-	                                 &ts) == XRT_SUCCESS &&
-	    ts != pc->last_ht_ts) {
-		pc->last_ht_ts = ts;
-		pc->win_ht_updates++;
+	// The raw Mercury device answers in the view-0 camera frame (-Z forward, +Y up), metres.
+	const enum xrt_input_name names[2] = {XRT_INPUT_HT_UNOBSTRUCTED_LEFT, XRT_INPUT_HT_UNOBSTRUCTED_RIGHT};
+	int64_t now = os_monotonic_get_ns();
+	pc->win_polls++;
+	for (int h = 0; h < 2; h++) {
+		struct xrt_hand_joint_set set;
+		int64_t ts = 0;
+		if (xrt_device_get_hand_tracking(pc->ht_raw, names[h], now, &set, &ts) != XRT_SUCCESS) {
+			continue;
+		}
+		if (h == 0 && ts != pc->last_ht_ts) {
+			pc->last_ht_ts = ts;
+			pc->win_ht_updates++;
+		}
+		if (set.is_active) {
+			pc->win_active[h]++;
+			pc->last_wrist[h] =
+			    set.values.hand_joint_set_default[XRT_HAND_JOINT_WRIST].relation.pose.position;
+		}
 	}
 #else
 	(void)pc;
@@ -370,7 +385,16 @@ update_stats(struct pimax_camera *pc, int64_t now)
 	if (pc->stats_ht) {
 		CAM_INFO(pc, "mercury: %.2f processed pairs/s (SLAM placeholder got %" PRIu64 "/%" PRIu64 " frames)",
 		         pc->mercury_fps, pc->slam_stub_frames[0], pc->slam_stub_frames[1]);
+		for (int h = 0; h < 2; h++) {
+			struct xrt_vec3 w = pc->last_wrist[h];
+			CAM_INFO(pc,
+			         "mercury: %s hand active in %" PRIu64 "/%" PRIu64
+			         " polls%s (last wrist %.2f %.2f %.2f m, camera %u frame)",
+			         h == 0 ? "left" : "right", pc->win_active[h], pc->win_polls,
+			         pc->win_active[h] > 0 ? "" : ", none seen", w.x, w.y, w.z, pc->ht_cams[0]);
+		}
 	}
+	pc->win_polls = pc->win_active[0] = pc->win_active[1] = 0;
 	pc->win_start_ns = now;
 	pc->win_frames = pc->win_tracking = pc->win_ht_updates = 0;
 }
