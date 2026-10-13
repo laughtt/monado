@@ -51,6 +51,7 @@
 #include <stdio.h>
 #include <assert.h>
 #include <math.h>
+#include <unistd.h>
 
 DEBUG_GET_ONCE_LOG_OPTION(comp_frame_lag_level, "XRT_COMP_FRAME_LAG_LOG_AS_LEVEL", U_LOGGING_WARN)
 #define LOG_FRAME_LAG(...) U_LOG_IFL(debug_get_log_option_comp_frame_lag_level(), u_log_get_global_level(), __VA_ARGS__)
@@ -1081,6 +1082,11 @@ dispatch_compute(struct comp_renderer *r,
 /*!
  * Debug: XRT_COMPOSITOR_DUMP_DIR=<dir> [XRT_COMPOSITOR_DUMP_FRAMES=a,b,c] writes the final target image
  * (before present) of selected frame numbers as raw files <dir>/frame<N>_<w>x<h>_fmt<vkformat>.raw.
+ *
+ * XRT_COMPOSITOR_DUMP_TRIGGER=<file> additionally dumps the next frame whenever <file> exists and deletes it once the
+ * dump is written (or failed), so a test client can ask for a frame at the moment its pattern is on screen
+ * (pimax-lenstest --capture). Without XRT_COMPOSITOR_DUMP_FRAMES the default frame list is not used when a trigger
+ * is set.
  */
 static void
 debug_dump_target(struct comp_renderer *r, uint32_t frame_no)
@@ -1089,9 +1095,11 @@ debug_dump_target(struct comp_renderer *r, uint32_t frame_no)
 	if (dir == NULL) {
 		return;
 	}
+	const char *trigger = getenv("XRT_COMPOSITOR_DUMP_TRIGGER");
+	const bool triggered = trigger != NULL && access(trigger, F_OK) == 0;
 	const char *frames = getenv("XRT_COMPOSITOR_DUMP_FRAMES");
 	if (frames == NULL) {
-		frames = "100,101,300,301";
+		frames = trigger != NULL ? "" : "100,101,300,301";
 	}
 	bool match = false;
 	char *copy = strdup(frames);
@@ -1101,7 +1109,7 @@ debug_dump_target(struct comp_renderer *r, uint32_t frame_no)
 		}
 	}
 	free(copy);
-	if (!match) {
+	if (!match && !triggered) {
 		return;
 	}
 
@@ -1127,6 +1135,9 @@ debug_dump_target(struct comp_renderer *r, uint32_t frame_no)
 	ret = vk->vkCreateBuffer(vk->device, &bi, NULL, &buf);
 	if (ret != VK_SUCCESS) {
 		COMP_ERROR(r->c, "dump: vkCreateBuffer %d", ret);
+		if (triggered) {
+			unlink(trigger);
+		}
 		return;
 	}
 	VkMemoryRequirements mr;
@@ -1223,6 +1234,9 @@ out:
 	}
 	if (mem != VK_NULL_HANDLE) {
 		vk->vkFreeMemory(vk->device, mem, NULL);
+	}
+	if (triggered) {
+		unlink(trigger); // tells the requester the dump is finished
 	}
 }
 
