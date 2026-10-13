@@ -293,6 +293,7 @@ pimax_hmd_destroy(struct xrt_device *xdev)
 	}
 
 	u_var_remove_root(hmd);
+	pimax_lens_destroy(&hmd->lens);
 	m_imu_3dof_close(&hmd->fusion);
 	m_relation_history_destroy(&hmd->relation_hist);
 	u_device_free(&hmd->base);
@@ -348,6 +349,13 @@ pimax_hmd_get_visibility_mask(struct xrt_device *xdev,
                               uint32_t view_index,
                               struct xrt_visibility_mask **out_mask)
 {
+	struct pimax_hmd *hmd = pimax_hmd(xdev);
+	// A configured edge black-out / mask (lens.conf) gets its own mesh, otherwise the generic FOV mask.
+	struct xrt_visibility_mask *custom = pimax_lens_visibility_mask(&hmd->lens, type, view_index);
+	if (custom != NULL) {
+		*out_mask = custom;
+		return XRT_SUCCESS;
+	}
 	struct xrt_fov fov = xdev->hmd->distortion.fov[view_index];
 	u_visibility_mask_get_default(type, &fov, out_mask);
 	return XRT_SUCCESS;

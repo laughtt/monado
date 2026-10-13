@@ -134,6 +134,18 @@ if(XRT_BUILD_DRIVER_PIMAX)
 	target_include_directories(drv_pimax PRIVATE ${PIMAX_LIBPIMAX_DIR}/include)
 	target_link_libraries(drv_pimax PRIVATE xrt-interfaces aux_util aux_math Threads::Threads)
 	list(APPEND ENABLED_HEADSET_DRIVERS pimax)
+
+	# The lens model (distortion math, lens.conf parser, visibility mask, debug UV grid) is Rust (rust/pimax-lens);
+	# pimax_lens.c is thin glue over its C ABI. libpimax_lens.a is built next to libpimax_capi.a:
+	#   (cd ~/pimax-re/rust && cargo build --release -p pimax-lens)
+	set(PIMAX_LENS_DIR "$ENV{HOME}/omarchyvr/rust/pimax-lens" CACHE PATH "Path to the pimax-lens crate (include/pimax_lens_rs.h)")
+	if(NOT EXISTS "${PIMAX_RUST_TARGET_DIR}/libpimax_lens.a")
+		message(FATAL_ERROR "pimax driver: ${PIMAX_RUST_TARGET_DIR}/libpimax_lens.a not found. Build it with: "
+			"(cd ~/pimax-re/rust && cargo build --release -p pimax-lens), or set PIMAX_RUST_TARGET_DIR to the directory that has it.")
+	endif()
+	target_include_directories(drv_pimax PRIVATE ${PIMAX_LENS_DIR}/include)
+	# native-static-libs reported by rustc for the staticlibs: -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc
+	target_link_libraries(drv_pimax PRIVATE ${PIMAX_RUST_TARGET_DIR}/libpimax_lens.a ${CMAKE_DL_LIBS} m rt util Threads::Threads)
 endif()
 
 if(XRT_BUILD_DRIVER_HYDRA)
