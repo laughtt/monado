@@ -21,7 +21,7 @@ extern "C" {
  * @brief 3DoF driver for the Pimax Dream Air on top of libpimax (hidraw wake/keepalive + 1 kHz IMU).
  *
  * Env vars: PIMAX_LOG, PIMAX_PANEL_ROTATION (0/90/180/270, default 0, TODO),
- * PIMAX_AXIS_MODE (0 = identity, 1 = 180 deg about Y), PIMAX_BIAS_SECONDS (default 2).
+ * PIMAX_AXIS_MODE (0 = identity, 1 = 180 deg about Y, default: verified by nose-down tilt test 2026-10-13), PIMAX_BIAS_SECONDS (default 2).
  */
 
 #define PIMAX_DRV_VID 0x34a4
