@@ -15,12 +15,15 @@
 #include "util/u_handles.h"
 #include "util/u_trace_marker.h"
 #include "util/u_debug.h"
+#include "util/u_time.h"
 
 #include "comp_vk_client.h"
 
 
 // Prefixed with OXR since the only user right now is the OpenXR state tracker.
 DEBUG_GET_ONCE_LOG_OPTION(vulkan_log, "OXR_VULKAN_LOG", U_LOGGING_INFO)
+// Keep destroyed swapchain images alive until the GPU is done with them (see client_vk_retired).
+DEBUG_GET_ONCE_BOOL_OPTION(defer_swapchain_free, "CLIENT_VK_DEFER_SWAPCHAIN_FREE", true)
 
 /*!
  * Down-cast helper.
@@ -260,6 +263,149 @@ submit_fallback(struct client_vk_compositor *c, xrt_result_t *out_xret)
 
 /*
  *
+ * Deferred freeing of destroyed swapchains.
+ *
+ */
+
+static void
+retired_free(struct client_vk_compositor *c, struct client_vk_retired *r)
+{
+	struct vk_bundle *vk = &c->vk;
+
+	if (r->cmd_count > 0) {
+		vk_cmd_pool_lock(&c->pool);
+		vk->vkFreeCommandBuffers(vk->device, c->pool.pool, r->cmd_count, r->cmds);
+		vk_cmd_pool_unlock(&c->pool);
+	}
+
+	for (uint32_t i = 0; i < r->image_count; i++) {
+		if (r->images[i] != VK_NULL_HANDLE) {
+			vk->vkDestroyImage(vk->device, r->images[i], NULL);
+		}
+		if (r->mems[i] != VK_NULL_HANDLE) {
+			vk->vkFreeMemory(vk->device, r->mems[i], NULL);
+		}
+	}
+
+	if (r->fence != VK_NULL_HANDLE) {
+		vk->vkDestroyFence(vk->device, r->fence, NULL);
+	}
+
+	free(r);
+}
+
+/*!
+ * Called from layer_commit, where the app (and wineopenxr for D3D11 apps) has
+ * all work for the previous frames submitted and holds the queue: put a fence
+ * behind that work for every newly retired swapchain, and free the retired
+ * swapchains whose fence has signalled. Never blocks.
+ */
+static void
+retired_process(struct client_vk_compositor *c)
+{
+	struct vk_bundle *vk = &c->vk;
+	struct client_vk_retired *done = NULL;
+
+	os_mutex_lock(&c->retired.mutex);
+
+	struct client_vk_retired **link = &c->retired.list;
+	while (*link != NULL) {
+		struct client_vk_retired *r = *link;
+
+		if (r->fence == VK_NULL_HANDLE) {
+			VkFenceCreateInfo create_info = {
+			    .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+			};
+			VkResult ret = vk->vkCreateFence(vk->device, &create_info, NULL, &r->fence);
+			if (ret == VK_SUCCESS) {
+				// Empty submit, the fence covers all work submitted to the queue before it.
+				vk_queue_lock(vk->main_queue);
+				ret = vk->vkQueueSubmit(vk->main_queue->queue, 0, NULL, r->fence);
+				vk_queue_unlock(vk->main_queue);
+				if (ret != VK_SUCCESS) {
+					VK_ERROR(vk, "vkQueueSubmit (retire fence): %s", vk_result_string(ret));
+					vk->vkDestroyFence(vk->device, r->fence, NULL);
+					r->fence = VK_NULL_HANDLE;
+				}
+			} else {
+				VK_ERROR(vk, "vkCreateFence (retire fence): %s", vk_result_string(ret));
+				r->fence = VK_NULL_HANDLE;
+			}
+			link = &r->next;
+			continue;
+		}
+
+		if (vk->vkGetFenceStatus(vk->device, r->fence) != VK_NOT_READY) {
+			// Signalled (or device lost, nothing left to wait for).
+			*link = r->next;
+			r->next = done;
+			done = r;
+			continue;
+		}
+
+		link = &r->next;
+	}
+
+	os_mutex_unlock(&c->retired.mutex);
+
+	while (done != NULL) {
+		struct client_vk_retired *r = done;
+		done = r->next;
+		VK_DEBUG(vk, "Freeing %u retired swapchain images", r->image_count);
+		retired_free(c, r);
+	}
+}
+
+/*!
+ * Called when the compositor (session) is destroyed: wait for the retired
+ * swapchains and free them.
+ */
+static void
+retired_flush_all(struct client_vk_compositor *c)
+{
+	struct vk_bundle *vk = &c->vk;
+
+	os_mutex_lock(&c->retired.mutex);
+	struct client_vk_retired *list = c->retired.list;
+	c->retired.list = NULL;
+	os_mutex_unlock(&c->retired.mutex);
+
+	if (list == NULL) {
+		return;
+	}
+
+	bool need_idle = false;
+	for (struct client_vk_retired *r = list; r != NULL; r = r->next) {
+		if (r->fence == VK_NULL_HANDLE) {
+			need_idle = true;
+		}
+	}
+
+	if (need_idle) {
+		/*
+		 * No frame was committed since the swapchain was destroyed, so
+		 * there is no fence behind the app's work. The app does not hold
+		 * its queue for us here, but this only happens at session
+		 * teardown, where waiting for idle is the lesser evil.
+		 */
+		vk_queue_lock(vk->main_queue);
+		vk->vkDeviceWaitIdle(vk->device);
+		vk_queue_unlock(vk->main_queue);
+	}
+
+	while (list != NULL) {
+		struct client_vk_retired *r = list;
+		list = r->next;
+		if (r->fence != VK_NULL_HANDLE) {
+			vk->vkWaitForFences(vk->device, 1, &r->fence, VK_TRUE, 2 * U_TIME_1S_IN_NS);
+		}
+		retired_free(c, r);
+	}
+}
+
+
+/*
+ *
  * Swapchain function.
  *
  */
@@ -272,6 +418,34 @@ client_vk_swapchain_destroy(struct xrt_swapchain *xsc)
 	struct client_vk_swapchain *sc = client_vk_swapchain(xsc);
 	struct client_vk_compositor *c = sc->c;
 	struct vk_bundle *vk = &c->vk;
+
+	if (debug_get_bool_option_defer_swapchain_free()) {
+		struct client_vk_retired *r = U_TYPED_CALLOC(struct client_vk_retired);
+		for (uint32_t i = 0; i < sc->base.base.image_count; i++) {
+			r->images[i] = sc->base.images[i];
+			r->mems[i] = sc->mems[i];
+			if (sc->acquire[i] != VK_NULL_HANDLE) {
+				r->cmds[r->cmd_count++] = sc->acquire[i];
+			}
+			if (sc->release[i] != VK_NULL_HANDLE) {
+				r->cmds[r->cmd_count++] = sc->release[i];
+			}
+		}
+		r->image_count = sc->base.base.image_count;
+
+		os_mutex_lock(&c->retired.mutex);
+		r->next = c->retired.list;
+		c->retired.list = r;
+		os_mutex_unlock(&c->retired.mutex);
+
+		VK_DEBUG(vk, "Deferring free of %u swapchain images until the GPU is done with them", r->image_count);
+
+		// Drop our reference, does NULL checking.
+		xrt_swapchain_native_reference(&sc->xscn, NULL);
+
+		free(sc);
+		return;
+	}
 
 	vk_cmd_pool_lock(&c->pool);
 	for (uint32_t i = 0; i < sc->base.base.image_count; i++) {
@@ -407,6 +581,10 @@ client_vk_compositor_destroy(struct xrt_compositor *xc)
 		c->sync.semaphore = VK_NULL_HANDLE;
 	}
 	xrt_compositor_semaphore_reference(&c->sync.xcsem, NULL);
+
+	// Wait for and free swapchains the app destroyed, needs the pool.
+	retired_flush_all(c);
+	os_mutex_destroy(&c->retired.mutex);
 
 	// Now safe to free the pool.
 	vk_cmd_pool_destroy(vk, &c->pool);
@@ -627,6 +805,9 @@ client_vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_h
 			return XRT_ERROR_FAILED_TO_SUBMIT_VULKAN_COMMANDS;
 		}
 	}
+
+	// Fence and free swapchains the app destroyed since the last commit.
+	retired_process(c);
 
 	xrt_result_t xret = XRT_SUCCESS;
 	if (submit_handle(c, sync_handle, &xret)) {
@@ -861,6 +1042,7 @@ client_vk_compositor_create(struct xrt_compositor_native *xcn,
 
 	c->base.info.format_count = xcn->base.info.format_count;
 	c->renderdoc_enabled = renderdoc_enabled;
+	os_mutex_init(&c->retired.mutex);
 
 	// Default to info.
 	enum u_logging_level log_level = debug_get_log_option_vulkan_log();
@@ -938,6 +1120,7 @@ err_pool:
 err_mutex:
 	vk_deinit_mutex(&c->vk);
 err_free:
+	os_mutex_destroy(&c->retired.mutex);
 	free(c);
 
 	return NULL;

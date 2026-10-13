@@ -12,6 +12,7 @@
 #pragma once
 
 #include "vk/vk_helpers.h"
+#include "os/os_threading.h"
 #include "vk/vk_cmd_pool.h"
 #include "xrt/xrt_gfx_vk.h"
 
@@ -36,6 +37,31 @@ struct client_vk_compositor;
  * @ingroup comp_client
  * @implements xrt_swapchain_vk
  */
+/*!
+ * Resources of a destroyed swapchain waiting for the GPU to be done with them.
+ *
+ * Apps going through D3D11 translation (Proton wineopenxr + DXVK) call
+ * xrDestroySwapchain while DXVK still has GPU work in flight that renders
+ * into the swapchain images (D3D11 Release semantics defer destruction).
+ * Freeing the imported VkDeviceMemory right away unmaps it from the app's GPU
+ * address space and the in-flight work faults (NVIDIA Xid 31 FAULT_PDE).
+ *
+ * @ingroup comp_client
+ */
+struct client_vk_retired
+{
+	VkImage images[XRT_MAX_SWAPCHAIN_IMAGES];
+	VkDeviceMemory mems[XRT_MAX_SWAPCHAIN_IMAGES];
+	VkCommandBuffer cmds[XRT_MAX_SWAPCHAIN_IMAGES * 2];
+	uint32_t image_count;
+	uint32_t cmd_count;
+
+	//! Signalled when all work submitted before it is done, VK_NULL_HANDLE until submitted.
+	VkFence fence;
+
+	struct client_vk_retired *next;
+};
+
 struct client_vk_swapchain
 {
 	struct xrt_swapchain_vk base;
@@ -79,6 +105,18 @@ struct client_vk_compositor
 	struct vk_bundle vk;
 
 	struct vk_cmd_pool pool;
+
+	/*!
+	 * Swapchain images, memory and command buffers whose swapchain was
+	 * destroyed by the app but that may still be in use by GPU work the app
+	 * submitted earlier. Freed once a fence submitted after that work has
+	 * signalled, see @ref client_vk_retired.
+	 */
+	struct
+	{
+		struct os_mutex mutex;
+		struct client_vk_retired *list;
+	} retired;
 
 	bool renderdoc_enabled;
 	VkCommandBuffer dcb;
