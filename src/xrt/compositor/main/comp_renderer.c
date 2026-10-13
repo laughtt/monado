@@ -30,6 +30,7 @@
 #include "util/u_var.h"
 #include "util/u_frame_times_widget.h"
 #include "util/u_debug.h"
+#include "util/u_time.h"
 
 #include "util/comp_render.h"
 #include "util/comp_high_level_render.h"
@@ -52,8 +53,15 @@
 #include <assert.h>
 #include <math.h>
 #include <unistd.h>
+#include <inttypes.h>
 
 DEBUG_GET_ONCE_LOG_OPTION(comp_frame_lag_level, "XRT_COMP_FRAME_LAG_LOG_AS_LEVEL", U_LOGGING_WARN)
+/*!
+ * Seconds the renderer waits for its GPU work before it gives up on the frame and stops submitting until the work
+ * completes (0 = wait forever, upstream behaviour). A stuck present then cannot wedge the compositor thread and with
+ * it the shutdown (analysis/hang-worn-debug.md).
+ */
+DEBUG_GET_ONCE_NUM_OPTION(comp_gpu_wait_timeout_s, "XRT_COMPOSITOR_GPU_WAIT_TIMEOUT_S", 3)
 #define LOG_FRAME_LAG(...) U_LOG_IFL(debug_get_log_option_comp_frame_lag_level(), u_log_get_global_level(), __VA_ARGS__)
 
 /*
@@ -171,6 +179,20 @@ struct comp_renderer
 	bool shared_present_semaphore_wait_once;
 
 	//! @}
+
+	//! @name Bounded GPU waits (XRT_COMPOSITOR_GPU_WAIT_TIMEOUT_S)
+	//! @{
+
+	//! Signalled by an empty submit after the frame's work: replaces vkQueueWaitIdle.
+	VkFence idle_fence;
+
+	//! The last wait gave up: @ref stuck_fence is still pending, no new GPU work is submitted until it signals.
+	bool gpu_stuck;
+	VkFence stuck_fence;
+	uint64_t stuck_since_ns;
+	uint64_t stuck_skipped_frames;
+
+	//! @}
 };
 
 
@@ -180,15 +202,140 @@ struct comp_renderer
  *
  */
 
-static void
+//! Short description of whether the GPU timestamps of the last frame are written (non-blocking).
+static const char *
+renderer_frame_gpu_state(struct comp_renderer *r)
+{
+	struct vk_bundle *vk = &r->c->base.vk;
+	if (r->c->nr.query_pool == VK_NULL_HANDLE) {
+		return "no timestamp query pool";
+	}
+	uint64_t ts[2] = {0};
+	VkResult ret = vk->vkGetQueryPoolResults(vk->device, r->c->nr.query_pool, 0, 2, sizeof(ts), ts,
+	                                         sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+	switch (ret) {
+	case VK_SUCCESS: return "frame GPU work finished (timestamps written): stuck after it, in the present/flip";
+	case VK_NOT_READY: return "frame GPU work NOT finished (timestamps missing): stuck in compositor GPU work";
+	default: return vk_result_string(ret);
+	}
+}
+
+/*!
+ * While a wait has given up: true if the stuck fence is still pending (the caller must not submit or touch GPU
+ * resources), false once it signalled (state cleared).
+ */
+static bool
+renderer_gpu_still_stuck(struct comp_renderer *r)
+{
+	if (!r->gpu_stuck) {
+		return false;
+	}
+	struct vk_bundle *vk = &r->c->base.vk;
+	VkResult ret = vk->vkGetFenceStatus(vk->device, r->stuck_fence);
+	if (ret == VK_NOT_READY) {
+		r->stuck_skipped_frames++;
+		return true;
+	}
+	COMP_ERROR(r->c, "GPU work completed again after %.1f s (%s), %" PRIu64 " frames skipped; resuming.",
+	           (double)(os_monotonic_get_ns() - r->stuck_since_ns) / 1e9, vk_result_string(ret),
+	           r->stuck_skipped_frames);
+	r->gpu_stuck = false;
+	r->stuck_fence = VK_NULL_HANDLE;
+	r->stuck_skipped_frames = 0;
+	return false;
+}
+
+/*!
+ * Wait for @p fence in 1 s slices, logging each slice, up to XRT_COMPOSITOR_GPU_WAIT_TIMEOUT_S. On give-up the fence is
+ * remembered as stuck and false is returned; the caller must then not reset or reuse it.
+ */
+static bool
+renderer_wait_fence_bounded(struct comp_renderer *r, VkFence fence, const char *what)
+{
+	struct vk_bundle *vk = &r->c->base.vk;
+	const int64_t limit_s = debug_get_num_option_comp_gpu_wait_timeout_s();
+	const uint64_t start_ns = os_monotonic_get_ns();
+
+	for (int64_t s = 1;; s++) {
+		VkResult ret = vk->vkWaitForFences(vk->device, 1, &fence, VK_TRUE, limit_s > 0 ? U_TIME_1S_IN_NS : UINT64_MAX);
+		if (ret == VK_SUCCESS) {
+			if (s > 1) {
+				COMP_ERROR(r->c, "%s: GPU done after %.1f s.", what,
+				           (double)(os_monotonic_get_ns() - start_ns) / 1e9);
+			}
+			return true;
+		}
+		if (ret != VK_TIMEOUT) {
+			COMP_ERROR(r->c, "%s: vkWaitForFences: %s", what, vk_result_string(ret));
+			return ret != VK_ERROR_DEVICE_LOST; // device lost: treat as stuck, never submit again
+		}
+		COMP_ERROR(r->c, "%s: GPU not done after %" PRId64 " s; %s.", what, s, renderer_frame_gpu_state(r));
+		if (s >= limit_s) {
+			COMP_ERROR(r->c,
+			           "%s: giving up after %" PRId64 " s (XRT_COMPOSITOR_GPU_WAIT_TIMEOUT_S): no more GPU work is "
+			           "submitted until it completes, so the compositor thread and shutdown are not wedged.",
+			           what, s);
+			r->gpu_stuck = true;
+			r->stuck_fence = fence;
+			r->stuck_since_ns = start_ns;
+			r->stuck_skipped_frames = 0;
+			return false;
+		}
+	}
+}
+
+/*!
+ * Wait until all work submitted to the main queue so far is done. Upstream uses vkQueueWaitIdle here, which waits
+ * forever (and with the queue lock held) when a present never retires; this submits an empty batch with a fence and
+ * waits for that fence with a bound instead. Returns false if the wait gave up (or an earlier one is still stuck).
+ */
+static bool
 renderer_wait_queue_idle(struct comp_renderer *r)
 {
 	COMP_TRACE_MARKER();
 	struct vk_bundle *vk = &r->c->base.vk;
 
-	vk_queue_lock(vk->main_queue);
-	vk->vkQueueWaitIdle(vk->main_queue->queue);
-	vk_queue_unlock(vk->main_queue);
+	if (renderer_gpu_still_stuck(r)) {
+		return false;
+	}
+
+	if (debug_get_num_option_comp_gpu_wait_timeout_s() <= 0) {
+		vk_queue_lock(vk->main_queue);
+		vk->vkQueueWaitIdle(vk->main_queue->queue);
+		vk_queue_unlock(vk->main_queue);
+		return true;
+	}
+
+	VkResult ret;
+	if (r->idle_fence == VK_NULL_HANDLE) {
+		VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+		ret = vk->vkCreateFence(vk->device, &fci, NULL, &r->idle_fence);
+		if (ret != VK_SUCCESS) {
+			r->idle_fence = VK_NULL_HANDLE;
+		}
+	} else {
+		ret = vk->vkResetFences(vk->device, 1, &r->idle_fence);
+	}
+
+	if (ret == VK_SUCCESS) {
+		vk_queue_lock(vk->main_queue);
+		ret = vk->vkQueueSubmit(vk->main_queue->queue, 0, NULL, r->idle_fence);
+		vk_queue_unlock(vk->main_queue);
+	}
+	if (ret != VK_SUCCESS) {
+		COMP_ERROR(r->c, "bounded queue idle: %s, falling back to vkQueueWaitIdle", vk_result_string(ret));
+		vk_queue_lock(vk->main_queue);
+		vk->vkQueueWaitIdle(vk->main_queue->queue);
+		vk_queue_unlock(vk->main_queue);
+		return true;
+	}
+
+	if (!renderer_wait_fence_bounded(r, r->idle_fence, "queue idle")) {
+		// The fence is still pending: it now belongs to the stuck state, never reset or destroy it while pending.
+		r->idle_fence = VK_NULL_HANDLE;
+		return false;
+	}
+	return true;
 }
 
 static void
@@ -578,7 +725,10 @@ renderer_ensure_images_and_renderings(struct comp_renderer *r, bool force_recrea
 	 * make sure that validation doesn't complain. This is done
 	 * during resize so isn't time critical.
 	 */
-	renderer_wait_queue_idle(r);
+	if (!renderer_wait_queue_idle(r)) {
+		// GPU work is stuck: the old images, renderings and fences may still be in use, do not destroy them.
+		return false;
+	}
 
 	// Make we sure we destroy all dependent things before creating new images.
 	renderer_close_renderings_and_fences(r);
@@ -683,6 +833,14 @@ renderer_wait_for_last_fence(struct comp_renderer *r)
 
 	struct vk_bundle *vk = &r->c->base.vk;
 	VkResult ret;
+
+	if (debug_get_num_option_comp_gpu_wait_timeout_s() > 0) {
+		(void)ret;
+		// On give-up the stuck state keeps watching this fence; draws are skipped until it signals.
+		renderer_wait_fence_bounded(r, r->fences[r->fenced_buffer], "last frame fence");
+		r->fenced_buffer = -1;
+		return;
+	}
 
 	ret = vk->vkWaitForFences(vk->device, 1, &r->fences[r->fenced_buffer], VK_TRUE, UINT64_MAX);
 	if (ret != VK_SUCCESS) {
@@ -816,6 +974,11 @@ renderer_acquire_swapchain_image(struct comp_renderer *r)
 		ret = comp_target_acquire(r->c->target, &buffer_index);
 	}
 
+	if (ret == VK_TIMEOUT) {
+		// Bounded acquire gave up (presents not retiring): no image, the draw is skipped.
+		COMP_ERROR(r->c, "comp_target_acquire: VK_TIMEOUT, skipping this frame");
+		return;
+	}
 	if (ret != VK_SUCCESS) {
 		COMP_ERROR(r->c, "comp_target_acquire: %s", vk_result_string(ret));
 	}
@@ -923,6 +1086,15 @@ static void
 renderer_fini(struct comp_renderer *r)
 {
 	struct vk_bundle *vk = &r->c->base.vk;
+
+	if (renderer_gpu_still_stuck(r)) {
+		COMP_ERROR(r->c, "Tearing down while GPU work has been stuck for %.1f s; freeing anyway so the service exits.",
+		           (double)(os_monotonic_get_ns() - r->stuck_since_ns) / 1e9);
+	}
+	if (r->idle_fence != VK_NULL_HANDLE) {
+		vk->vkDestroyFence(vk->device, r->idle_fence, NULL);
+		r->idle_fence = VK_NULL_HANDLE;
+	}
 
 	// Command buffers
 	renderer_close_renderings_and_fences(r);
@@ -1264,8 +1436,8 @@ comp_renderer_draw(struct comp_renderer *r)
 	// Tell the target we are starting to render, for frame timing.
 	comp_target_mark_begin(ct, c->frame.rendering.id, os_monotonic_get_ns());
 
-	// Are we ready to render? No - skip rendering.
-	if (!comp_target_check_ready(r->c->target)) {
+	// Are we ready to render? No - skip rendering. Also skip while earlier GPU work is stuck (bounded waits).
+	if (renderer_gpu_still_stuck(r) || !comp_target_check_ready(r->c->target)) {
 		// Need to emulate rendering for the timing.
 		//! @todo This should be discard.
 		comp_target_mark_submit_begin(ct, c->frame.rendering.id, os_monotonic_get_ns());
@@ -1283,6 +1455,14 @@ comp_renderer_draw(struct comp_renderer *r)
 	if (r->acquired_buffer < 0) {
 		// Ensures that renderings are created.
 		renderer_acquire_swapchain_image(r);
+	}
+
+	if (r->acquired_buffer < 0 && debug_get_num_option_comp_gpu_wait_timeout_s() > 0) {
+		// No image (bounded acquire gave up, or images could not be made): emulate rendering for the timing.
+		comp_target_mark_submit_begin(ct, c->frame.rendering.id, os_monotonic_get_ns());
+		comp_target_mark_submit_end(ct, c->frame.rendering.id, os_monotonic_get_ns());
+		comp_frame_clear_locked(&c->frame.rendering);
+		return XRT_SUCCESS;
 	}
 
 	comp_target_update_timings(ct);
@@ -1405,7 +1585,7 @@ comp_renderer_draw(struct comp_renderer *r)
 	 *
 	 * This is done after a swap so isn't time critical.
 	 */
-	renderer_wait_queue_idle(r);
+	bool queue_idle = renderer_wait_queue_idle(r);
 
 	/*
 	 * Free any resources and finalize the scratch images,
@@ -1413,8 +1593,8 @@ comp_renderer_draw(struct comp_renderer *r)
 	 */
 	chl_frame_state_fini(&frame_state);
 
-	// Check timestamps.
-	if (xret == XRT_SUCCESS) {
+	// Check timestamps (not while stuck: the query read waits for the GPU).
+	if (xret == XRT_SUCCESS && queue_idle) {
 		/*
 		 * Get timestamps of GPU work (if available).
 		 */

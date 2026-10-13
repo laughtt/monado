@@ -14,6 +14,8 @@
 #include "util/u_misc.h"
 #include "util/u_pacing.h"
 #include "util/u_debug.h"
+#include "util/u_time.h"
+#include <inttypes.h>
 #include "util/u_pretty_print.h"
 #include "util/u_thread_priority.h"
 
@@ -49,6 +51,8 @@
 DEBUG_GET_ONCE_NUM_OPTION(preferred_at_least_image_count, "XRT_COMPOSITOR_PREFERRED_IMAGE_COUNT", 2)
 DEBUG_GET_ONCE_BOOL_OPTION(use_present_wait, "XRT_COMPOSITOR_USE_PRESENT_WAIT", false)
 DEBUG_GET_ONCE_BOOL_OPTION(use_display_timing, "XRT_COMPOSITOR_USE_DISPLAY_TIMING", true)
+//! Bound for vkAcquireNextImageKHR (same variable as the renderer's GPU waits; 0 = wait forever).
+DEBUG_GET_ONCE_NUM_OPTION(acquire_timeout_s, "XRT_COMPOSITOR_GPU_WAIT_TIMEOUT_S", 3)
 
 static inline struct vk_bundle *
 get_vk(struct comp_target_swapchain *cts)
@@ -963,13 +967,26 @@ comp_target_swapchain_acquire_next_image(struct comp_target *ct, uint32_t *out_i
 	}
 #endif
 
-	VkResult ret = vk->vkAcquireNextImageKHR(  //
-	    vk->device,                            // device
-	    cts->swapchain.handle,                 // swapchain
-	    UINT64_MAX,                            // timeout
-	    cts->base.semaphores.present_complete, // semaphore
-	    VK_NULL_HANDLE,                        // fence
-	    out_index);                            // pImageIndex
+	// Bounded: when presents never retire, no image comes back; wait in 1 s slices and give up with VK_TIMEOUT so the
+	// compositor thread (and shutdown) is not wedged (analysis/hang-worn-debug.md).
+	const int64_t limit_s = debug_get_num_option_acquire_timeout_s();
+	VkResult ret;
+	for (int64_t s = 1;; s++) {
+		ret = vk->vkAcquireNextImageKHR(                         //
+		    vk->device,                                          // device
+		    cts->swapchain.handle,                               // swapchain
+		    limit_s > 0 ? U_TIME_1S_IN_NS : UINT64_MAX,          // timeout
+		    cts->base.semaphores.present_complete,               // semaphore
+		    VK_NULL_HANDLE,                                      // fence
+		    out_index);                                          // pImageIndex
+		if (ret != VK_TIMEOUT && ret != VK_NOT_READY) {
+			break;
+		}
+		COMP_ERROR(ct->c, "vkAcquireNextImageKHR: no image after %" PRId64 " s (presents not retiring?)", s);
+		if (s >= limit_s) {
+			return VK_TIMEOUT;
+		}
+	}
 	VK_CHK_AND_RET(ret, "vkAcquireNextImageKHR");
 
 #ifdef VK_KHR_shared_presentable_image
