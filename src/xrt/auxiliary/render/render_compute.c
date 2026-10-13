@@ -7,12 +7,15 @@
  * @ingroup aux_render
  */
 
+#include "util/u_debug.h"
 #include "math/m_api.h"
 #include "math/m_matrix_4x4_f64.h"
 
 #include "vk/vk_mini_helpers.h"
 
 #include "render/render_interface.h"
+
+#include <stddef.h>
 
 
 /*
@@ -278,6 +281,49 @@ update_compute_descriptor_set_target(struct vk_bundle *vk,
 	    NULL);                             // pDescriptorCopies
 }
 
+/*!
+ * Debug: XRT_COMPOSITOR_OUTPUT_GAMMA=<g> raises the sRGB encoded output to the power g (g < 1 brightens the mid tones,
+ * g > 1 darkens them); XRT_COMPOSITOR_OUTPUT_GAIN=<k> multiplies the linear colour before the sRGB encode. Both default
+ * to 1.0, which leaves the output bit-identical. Applied only by the compute distortion shader, the last stage that
+ * writes the final target image.
+ */
+DEBUG_GET_ONCE_FLOAT_OPTION(output_gamma, "XRT_COMPOSITOR_OUTPUT_GAMMA", 1.0f)
+DEBUG_GET_ONCE_FLOAT_OPTION(output_gain, "XRT_COMPOSITOR_OUTPUT_GAIN", 1.0f)
+
+// The std140 offset of "vec4 output_adjust" in the Config block of distortion.comp: views, pre_transform and
+// post_transform are 2 x 16 bytes each, the two timewarp matrix arrays 2 x 64 bytes each.
+_Static_assert(offsetof(struct render_compute_distortion_ubo_data, output_adjust) == 352,
+               "output_adjust must sit at the std140 offset that distortion.comp expects");
+
+static void
+fill_output_adjust(struct render_compute_distortion_ubo_data *data)
+{
+	float gamma = debug_get_float_option_output_gamma();
+	float gain = debug_get_float_option_output_gain();
+	// Guard against nonsense (the variables are meant for experiments): fall back to "unchanged", and say so.
+	bool gamma_ok = gamma > 0.05f && gamma < 20.0f; // false for NaN as well
+	bool gain_ok = gain > 0.0f && gain < 100.0f;
+	data->output_adjust[0] = gamma_ok ? gamma : 1.0f;
+	data->output_adjust[1] = gain_ok ? gain : 1.0f;
+	static bool warned_range = false;
+	if (!warned_range && (!gamma_ok || !gain_ok)) {
+		warned_range = true;
+		U_LOG_W("XRT_COMPOSITOR_OUTPUT_GAMMA (%f) must be in 0.05..20 and XRT_COMPOSITOR_OUTPUT_GAIN (%f) in "
+		        "0..100: the invalid one is ignored",
+		        gamma, gain);
+	}
+	data->output_adjust[2] = 0.0f;
+	data->output_adjust[3] = 0.0f;
+
+	static bool logged = false;
+	if (!logged && (data->output_adjust[0] != 1.0f || data->output_adjust[1] != 1.0f)) {
+		logged = true;
+		U_LOG_W("Output colour adjustment active: gamma %.3f (XRT_COMPOSITOR_OUTPUT_GAMMA), gain %.3f "
+		        "(XRT_COMPOSITOR_OUTPUT_GAIN)",
+		        data->output_adjust[0], data->output_adjust[1]);
+	}
+}
+
 static void
 dispatch_project_pipeline(struct render_compute *render,
                           VkSampler src_samplers[XRT_MAX_VIEWS],
@@ -303,6 +349,7 @@ dispatch_project_pipeline(struct render_compute *render,
 		data->views[i] = views[i];
 		data->post_transforms[i] = src_norm_rects[i];
 	}
+	fill_output_adjust(data);
 
 
 	/*

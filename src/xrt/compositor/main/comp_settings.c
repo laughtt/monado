@@ -11,6 +11,8 @@
 #include "util/u_debug.h"
 #include "comp_settings.h"
 
+#include <string.h>
+
 #ifdef XRT_OS_ANDROID
 #define USE_COMPUTE_DEFAULT false
 #else
@@ -36,7 +38,25 @@ DEBUG_GET_ONCE_BOOL_OPTION(xcb_fullscreen, "XRT_COMPOSITOR_XCB_FULLSCREEN", fals
 DEBUG_GET_ONCE_NUM_OPTION(xcb_display, "XRT_COMPOSITOR_XCB_DISPLAY", -1)
 DEBUG_GET_ONCE_NUM_OPTION(default_framerate, "XRT_COMPOSITOR_DEFAULT_FRAMERATE", 60)
 DEBUG_GET_ONCE_BOOL_OPTION(compute, "XRT_COMPOSITOR_COMPUTE", USE_COMPUTE_DEFAULT)
+DEBUG_GET_ONCE_OPTION(target_format, "XRT_COMPOSITOR_TARGET_FORMAT", NULL)
 // clang-format on
+
+/*!
+ * Names accepted by XRT_COMPOSITOR_TARGET_FORMAT, the format of the final image that is handed to the display.
+ */
+static const struct
+{
+	const char *name;
+	VkFormat format;
+} target_format_names[] = {
+    {"A2B10G10R10_UNORM", VK_FORMAT_A2B10G10R10_UNORM_PACK32},
+    {"B8G8R8A8_UNORM", VK_FORMAT_B8G8R8A8_UNORM},
+    {"R8G8B8A8_UNORM", VK_FORMAT_R8G8B8A8_UNORM},
+    {"A8B8G8R8_UNORM", VK_FORMAT_A8B8G8R8_UNORM_PACK32},
+    {"B8G8R8A8_SRGB", VK_FORMAT_B8G8R8A8_SRGB},
+    {"R8G8B8A8_SRGB", VK_FORMAT_R8G8B8A8_SRGB},
+    {"A8B8G8R8_SRGB", VK_FORMAT_A8B8G8R8_SRGB_PACK32},
+};
 
 static inline void
 add_format(struct comp_settings *s, VkFormat format)
@@ -51,6 +71,47 @@ add_format(struct comp_settings *s, VkFormat format)
 
 	s->formats[count++] = format;
 	s->format_count = count;
+}
+
+/*!
+ * XRT_COMPOSITOR_TARGET_FORMAT=<name>: try this target format before all others (for example B8G8R8A8_UNORM to get an
+ * 8 bit target instead of the 10 bit A2B10G10R10 one). Only formats that are already in the list are considered, the
+ * compute path cannot write sRGB formats, so for those use XRT_COMPOSITOR_COMPUTE=0.
+ */
+static void
+prefer_target_format(struct comp_settings *s)
+{
+	const char *want = debug_get_option_target_format();
+	if (want == NULL || want[0] == '\0') {
+		return;
+	}
+
+	VkFormat format = VK_FORMAT_UNDEFINED;
+	for (size_t i = 0; i < ARRAY_SIZE(target_format_names); i++) {
+		if (strcmp(want, target_format_names[i].name) == 0) {
+			format = target_format_names[i].format;
+			break;
+		}
+	}
+	if (format == VK_FORMAT_UNDEFINED) {
+		U_LOG_W("XRT_COMPOSITOR_TARGET_FORMAT=%s is not a known name (A2B10G10R10_UNORM, B8G8R8A8_UNORM, ...)", want);
+		return;
+	}
+
+	for (uint32_t i = 0; i < s->format_count; i++) {
+		if (s->formats[i] != format) {
+			continue;
+		}
+		// Move to the front, keep the order of the others.
+		for (uint32_t k = i; k > 0; k--) {
+			s->formats[k] = s->formats[k - 1];
+		}
+		s->formats[0] = format;
+		// A warning, not info: the default global log level hides info, and an experimental override should be visible.
+		U_LOG_W("XRT_COMPOSITOR_TARGET_FORMAT=%s: trying this target format first", want);
+		return;
+	}
+	U_LOG_W("XRT_COMPOSITOR_TARGET_FORMAT=%s is not usable with the current compositor mode, ignored", want);
 }
 
 static VkPresentModeKHR
@@ -159,6 +220,8 @@ comp_settings_init(struct comp_settings *s, struct xrt_device *xdev)
 		// Seen as the only sRGB format on some NVIDIA cards.
 		add_format(s, VK_FORMAT_A8B8G8R8_SRGB_PACK32);
 	}
+
+	prefer_target_format(s);
 
 	s->display = debug_get_num_option_xcb_display();
 	s->color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;

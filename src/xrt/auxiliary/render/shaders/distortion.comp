@@ -29,6 +29,9 @@ layout(set = 0, binding = 3, std140) uniform restrict Config
 	vec4 post_transform[2];
 	mat4 transform_timewarp_scanout_begin[2];
 	mat4 transform_timewarp_scanout_end[2];
+	// Output colour adjustment, see XRT_COMPOSITOR_OUTPUT_GAMMA / XRT_COMPOSITOR_OUTPUT_GAIN.
+	// x: exponent applied to the sRGB encoded result, y: gain applied to the linear colour. 1.0 / 1.0 = unchanged.
+	vec4 output_adjust;
 }ubo;
 
 
@@ -136,7 +139,14 @@ void main()
 	    1);                          //
 
 	// Do colour correction here since there are no automatic conversion in hardware available.
-	colour = vec4(from_linear_to_srgb(colour.rgb), 1);
+	vec3 encoded = from_linear_to_srgb(colour.rgb * ubo.output_adjust.y);
+
+	// Optional extra transfer step, off by default: the default values leave the encoded colour bit-identical.
+	if (ubo.output_adjust.x != 1.0) {
+		encoded = pow(max(encoded, vec3(0.0)), vec3(ubo.output_adjust.x));
+	}
+
+	colour = vec4(encoded, 1);
 
 	imageStore(target, ivec2(offset.x + ix, offset.y + iy), colour);
 }

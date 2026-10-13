@@ -1377,6 +1377,12 @@ struct render_compute_distortion_ubo_data
 	struct xrt_normalized_rect post_transforms[XRT_MAX_VIEWS];
 	struct xrt_matrix_4x4 transform_timewarp_scanout_begin[XRT_MAX_VIEWS];
 	struct xrt_matrix_4x4 transform_timewarp_scanout_end[XRT_MAX_VIEWS];
+
+	/*!
+	 * Output colour adjustment of distortion.comp: [0] exponent applied to the sRGB encoded result, [1] gain applied
+	 * to the linear colour, [2] and [3] unused. 1.0 and 1.0 leave the output unchanged.
+	 */
+	float output_adjust[4];
 };
 
 /*!
