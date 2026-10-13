@@ -294,7 +294,8 @@ make_attach_offset(struct pimax_camera *pc, struct xrt_pose *out_offset)
 static uint64_t
 frame_time(struct pimax_camera *pc, const pimax_cam_frame_info *fi)
 {
-	if (pc->clock != NULL) {
+	// A replay's device timestamps come from another session: use its rebased monotonic time instead.
+	if ((fi->flags & PIMAX_CAM_FLAG_REPLAY) == 0 && pc->clock != NULL) {
 		struct pimax_camera_clock_ref ref;
 		if (pc->clock(pc->clock_user, &ref) && ref.valid) {
 			pimax_cam_imu_clock_ref r;
