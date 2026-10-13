@@ -467,6 +467,16 @@ pimax_hmd_create(struct xrt_device *out_ctrls[2])
 	if (debug_get_bool_option_pimax_no_device()) {
 		HMD_WARN(hmd, "PIMAX_NO_DEVICE: headset not opened, identity pose");
 		u_var_add_root(hmd, "Pimax Dream Air (no device)", true);
+		// Test aid for the controller hand tracking: with PIMAX_CTRL_HANDS_DEMO=1 the controllers exist even without
+		// a headset (no attach thread, no reports; the scripted demo input drives the hands).
+		if (pimax_ctrl_demo_enabled()) {
+			hmd->ctrl = pimax_ctrl_create(&hmd->base, hmd->log_level, hmd->ctrl_devs);
+			if (hmd->ctrl != NULL) {
+				out_ctrls[0] = hmd->ctrl_devs[0];
+				out_ctrls[1] = hmd->ctrl_devs[1];
+				hmd->ctrl_handed_out = true;
+			}
+		}
 		return &hmd->base;
 	}
 
