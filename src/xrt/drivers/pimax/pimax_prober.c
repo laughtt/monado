@@ -36,5 +36,9 @@ pimax_found(struct xrt_prober *xp,
 			out_xdev[n++] = ctrls[i];
 		}
 	}
+	struct xrt_device *hands = pimax_hmd_take_hand_tracker(xdev);
+	if (hands != NULL) {
+		out_xdev[n++] = hands;
+	}
 	return n;
 }

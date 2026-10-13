@@ -121,8 +121,14 @@ if(XRT_BUILD_DRIVER_PIMAX)
 	option(PIMAX_USE_RUST_LIBPIMAX "Link libpimax_capi.a (Rust) instead of compiling libpimax/src/*.c" OFF)
 	set(PIMAX_RUST_TARGET_DIR "$ENV{HOME}/omarchyvr/rust/target/release" CACHE PATH "Directory with libpimax_capi.a")
 	find_package(Threads REQUIRED)
+	# Tracking cameras + Mercury hands: links the Rust pimax-cam staticlib (rust/pimax-cam, C ABI include/pimax_cam.h):
+	#   (cd ~/pimax-re/rust && cargo build --release -p pimax-cam)   -> ${PIMAX_RUST_TARGET_DIR}/libpimax_cam.a
+	# Runtime switch: PIMAX_HANDS=mercury (or PIMAX_CAM=1 for capture only), see pimax/pimax_camera.h.
+	option(PIMAX_CAM "Pimax tracking cameras and Mercury hand tracking (needs libpimax_cam.a)" OFF)
+	set(PIMAX_CAM_DIR "$ENV{HOME}/omarchyvr/rust/pimax-cam" CACHE PATH "pimax-cam crate (include/pimax_cam.h)")
 	set(PIMAX_DRIVER_SOURCES
 		pimax/pimax_hmd.c pimax/pimax_lens.c pimax/pimax_lens.h pimax/pimax_interface.h pimax/pimax_prober.c pimax/pimax_ctrl.c pimax/pimax_ctrl.h
+		pimax/pimax_camera.c pimax/pimax_camera.h
 		)
 	if(PIMAX_USE_RUST_LIBPIMAX)
 		add_library(drv_pimax STATIC ${PIMAX_DRIVER_SOURCES})
@@ -133,6 +139,17 @@ if(XRT_BUILD_DRIVER_PIMAX)
 	endif()
 	target_include_directories(drv_pimax PRIVATE ${PIMAX_LIBPIMAX_DIR}/include)
 	target_link_libraries(drv_pimax PRIVATE xrt-interfaces aux_util aux_math Threads::Threads)
+	if(PIMAX_CAM)
+		target_compile_definitions(drv_pimax PRIVATE PIMAX_HAVE_CAM)
+		target_include_directories(drv_pimax PRIVATE ${PIMAX_CAM_DIR}/include)
+		target_link_libraries(
+			drv_pimax PRIVATE ${PIMAX_RUST_TARGET_DIR}/libpimax_cam.a ${CMAKE_DL_LIBS} m rt util aux_util_sink
+					  aux_tracking drv_multi
+			)
+		if(XRT_BUILD_DRIVER_HANDTRACKING)
+			target_link_libraries(drv_pimax PRIVATE drv_ht)
+		endif()
+	endif()
 	list(APPEND ENABLED_HEADSET_DRIVERS pimax)
 endif()
 

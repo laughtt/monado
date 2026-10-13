@@ -35,6 +35,9 @@
 #include "pimax_interface.h"
 #include "pimax_lens.h"
 #include "pimax_ctrl.h"
+#include "pimax_camera.h"
+
+#include "os/os_threading.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -95,6 +98,12 @@ struct pimax_hmd
 
 	uint32_t count;
 	float bias_dps[3];
+
+	//! IMU clock snapshot for the cameras (written by the IMU callback).
+	struct os_mutex clk_lock;
+	struct pimax_camera_clock_ref clk;
+	//! Tracking cameras + Mercury (NULL unless PIMAX_HANDS / PIMAX_CAM).
+	struct pimax_camera *camera;
 };
 
 static inline struct pimax_hmd *
@@ -146,7 +155,31 @@ sample_time_ns(struct pimax_hmd *hmd, uint32_t dev_ts_us)
 		t = hmd->last_ts_ns + 1;
 	}
 	hmd->last_ts_ns = t;
+
+	os_mutex_lock(&hmd->clk_lock);
+	hmd->clk.dev_ts_u32 = dev_ts_us;
+	hmd->clk.dev_ext_us = hmd->dev_ts_ext_us;
+	hmd->clk.offset_ns = hmd->clock_offset_ns;
+	hmd->clk.valid = 1;
+	os_mutex_unlock(&hmd->clk_lock);
 	return t;
+}
+
+//! Camera thread: the IMU device-clock -> monotonic mapping, so frames share the IMU timeline.
+static bool
+pimax_hmd_clock_ref(void *user, struct pimax_camera_clock_ref *out)
+{
+	struct pimax_hmd *hmd = (struct pimax_hmd *)user;
+	os_mutex_lock(&hmd->clk_lock);
+	*out = hmd->clk;
+	os_mutex_unlock(&hmd->clk_lock);
+	return out->valid != 0;
+}
+
+struct xrt_device *
+pimax_hmd_take_hand_tracker(struct xrt_device *xdev)
+{
+	return pimax_camera_take_hand_device(pimax_hmd(xdev)->camera);
 }
 
 static void
@@ -278,6 +311,9 @@ pimax_hmd_destroy(struct xrt_device *xdev)
 {
 	struct pimax_hmd *hmd = pimax_hmd(xdev);
 
+	// Cameras first: their thread reads the IMU clock snapshot and pushes into Mercury.
+	pimax_camera_destroy(&hmd->camera);
+
 	// Stop the controller attach thread, then the session thread (and with it the callbacks) before freeing anything.
 	if (hmd->ctrl != NULL) {
 		pimax_ctrl_stop(hmd->ctrl);
@@ -295,6 +331,7 @@ pimax_hmd_destroy(struct xrt_device *xdev)
 	u_var_remove_root(hmd);
 	m_imu_3dof_close(&hmd->fusion);
 	m_relation_history_destroy(&hmd->relation_hist);
+	os_mutex_destroy(&hmd->clk_lock);
 	u_device_free(&hmd->base);
 }
 
@@ -371,6 +408,7 @@ pimax_hmd_create(struct xrt_device *out_ctrls[2])
 	}
 
 	hmd->log_level = debug_get_log_option_pimax_log();
+	os_mutex_init(&hmd->clk_lock);
 	hmd->axis_mode = (int)debug_get_num_option_pimax_axis_mode();
 	long bias_ms = debug_get_num_option_pimax_bias_ms();
 	hmd->bias_target = (uint32_t)(bias_ms < 200 ? 200 : bias_ms); // 1 kHz IMU: ms == samples
@@ -467,6 +505,8 @@ pimax_hmd_create(struct xrt_device *out_ctrls[2])
 	if (debug_get_bool_option_pimax_no_device()) {
 		HMD_WARN(hmd, "PIMAX_NO_DEVICE: headset not opened, identity pose");
 		u_var_add_root(hmd, "Pimax Dream Air (no device)", true);
+		// Cameras still work (live UVC or a PIMAX_CAM_SOURCE replay), timed without the IMU clock.
+		hmd->camera = pimax_camera_create(&hmd->base, hmd->log_level, NULL, NULL);
 		return &hmd->base;
 	}
 
@@ -526,6 +566,9 @@ pimax_hmd_create(struct xrt_device *out_ctrls[2])
 	u_var_add_f32(hmd, &hmd->bias_dps[0], "bias x dps");
 	u_var_add_f32(hmd, &hmd->bias_dps[1], "bias y dps");
 	u_var_add_f32(hmd, &hmd->bias_dps[2], "bias z dps");
+
+	// Tracking cameras and Mercury hands (PIMAX_HANDS=mercury or PIMAX_CAM=1); NULL otherwise.
+	hmd->camera = pimax_camera_create(&hmd->base, hmd->log_level, pimax_hmd_clock_ref, hmd);
 
 	HMD_INFO(hmd, "Pimax Dream Air up: keep the headset still for %u ms for gyro calibration (axis mode %d)",
 	         hmd->bias_target, hmd->axis_mode);
