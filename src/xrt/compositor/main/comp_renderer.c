@@ -589,7 +589,7 @@ renderer_ensure_images_and_renderings(struct comp_renderer *r, bool force_recrea
 		image_usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 	}
 
-	if (c->peek) {
+	if (c->peek || getenv("XRT_COMPOSITOR_DUMP_DIR")) {
 		image_usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 	}
 
@@ -1077,6 +1077,155 @@ dispatch_compute(struct comp_renderer *r,
 }
 
 
+
+/*!
+ * Debug: XRT_COMPOSITOR_DUMP_DIR=<dir> [XRT_COMPOSITOR_DUMP_FRAMES=a,b,c] writes the final target image
+ * (before present) of selected frame numbers as raw files <dir>/frame<N>_<w>x<h>_fmt<vkformat>.raw.
+ */
+static void
+debug_dump_target(struct comp_renderer *r, uint32_t frame_no)
+{
+	const char *dir = getenv("XRT_COMPOSITOR_DUMP_DIR");
+	if (dir == NULL) {
+		return;
+	}
+	const char *frames = getenv("XRT_COMPOSITOR_DUMP_FRAMES");
+	if (frames == NULL) {
+		frames = "100,101,300,301";
+	}
+	bool match = false;
+	char *copy = strdup(frames);
+	for (char *tok = strtok(copy, ","); tok != NULL; tok = strtok(NULL, ",")) {
+		if ((uint32_t)atoi(tok) == frame_no) {
+			match = true;
+		}
+	}
+	free(copy);
+	if (!match) {
+		return;
+	}
+
+	struct vk_bundle *vk = &r->c->base.vk;
+	struct comp_target *t = r->c->target;
+	VkImage image = t->images[r->acquired_buffer].handle;
+	uint32_t w = t->width, h = t->height;
+	VkDeviceSize size = (VkDeviceSize)w * h * 4;
+	VkResult ret;
+
+	VkBuffer buf = VK_NULL_HANDLE;
+	VkDeviceMemory mem = VK_NULL_HANDLE;
+	VkCommandPool pool = VK_NULL_HANDLE;
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	void *map = NULL;
+
+	VkBufferCreateInfo bi = {
+	    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+	    .size = size,
+	    .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	};
+	ret = vk->vkCreateBuffer(vk->device, &bi, NULL, &buf);
+	if (ret != VK_SUCCESS) {
+		COMP_ERROR(r->c, "dump: vkCreateBuffer %d", ret);
+		return;
+	}
+	VkMemoryRequirements mr;
+	vk->vkGetBufferMemoryRequirements(vk->device, buf, &mr);
+	uint32_t type = 0;
+	if (vk_get_memory_type(vk, mr.memoryTypeBits,
+	                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &type) == false) {
+		COMP_ERROR(r->c, "dump: no host memory type");
+		goto out;
+	}
+	VkMemoryAllocateInfo ai = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .allocationSize = mr.size,
+	    .memoryTypeIndex = type,
+	};
+	if (vk->vkAllocateMemory(vk->device, &ai, NULL, &mem) != VK_SUCCESS ||
+	    vk->vkBindBufferMemory(vk->device, buf, mem, 0) != VK_SUCCESS) {
+		COMP_ERROR(r->c, "dump: alloc/bind failed");
+		goto out;
+	}
+	VkCommandPoolCreateInfo pci = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+	    .queueFamilyIndex = vk->main_queue->family_index,
+	};
+	vk->vkCreateCommandPool(vk->device, &pci, NULL, &pool);
+	VkCommandBufferAllocateInfo cai = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+	    .commandPool = pool,
+	    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+	    .commandBufferCount = 1,
+	};
+	vk->vkAllocateCommandBuffers(vk->device, &cai, &cmd);
+	VkCommandBufferBeginInfo bgi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+	                                .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+	vk->vkBeginCommandBuffer(cmd, &bgi);
+	VkImageSubresourceRange sr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	VkImageMemoryBarrier b = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	    .oldLayout = t->final_layout,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = image,
+	    .subresourceRange = sr,
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
+	                         NULL, 1, &b);
+	VkBufferImageCopy reg = {
+	    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .imageExtent = {w, h, 1},
+	};
+	vk->vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &reg);
+	b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+	b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	b.newLayout = t->final_layout;
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0,
+	                         NULL, 1, &b);
+	vk->vkEndCommandBuffer(cmd);
+
+	VkSubmitInfo si = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .commandBufferCount = 1,
+	    .pCommandBuffers = &cmd,
+	};
+	vk_queue_lock(vk->main_queue);
+	vk->vkQueueWaitIdle(vk->main_queue->queue);
+	ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, VK_NULL_HANDLE);
+	vk->vkQueueWaitIdle(vk->main_queue->queue);
+	vk_queue_unlock(vk->main_queue);
+	if (ret != VK_SUCCESS) {
+		COMP_ERROR(r->c, "dump: submit %d", ret);
+		goto out;
+	}
+	if (vk->vkMapMemory(vk->device, mem, 0, size, 0, &map) == VK_SUCCESS) {
+		char path[1024];
+		snprintf(path, sizeof path, "%s/frame%u_%ux%u_fmt%d.raw", dir, frame_no, w, h, (int)t->format);
+		FILE *f = fopen(path, "wb");
+		if (f) {
+			fwrite(map, 1, size, f);
+			fclose(f);
+			COMP_INFO(r->c, "dumped %s", path);
+		}
+		vk->vkUnmapMemory(vk->device, mem);
+	}
+out:
+	if (pool != VK_NULL_HANDLE) {
+		vk->vkDestroyCommandPool(vk->device, pool, NULL);
+	}
+	if (buf != VK_NULL_HANDLE) {
+		vk->vkDestroyBuffer(vk->device, buf, NULL);
+	}
+	if (mem != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, mem, NULL);
+	}
+}
+
 /*
  *
  * Interface functions.
@@ -1191,6 +1340,11 @@ comp_renderer_draw(struct comp_renderer *r)
 		}
 	}
 #endif
+
+	{
+		static uint32_t dump_frame_no = 0;
+		debug_dump_target(r, dump_frame_no++);
+	}
 
 	bool present_success = renderer_present_swapchain_image(r, c->frame.rendering.desired_present_time_ns,
 	                                                        c->frame.rendering.present_slop_ns);
