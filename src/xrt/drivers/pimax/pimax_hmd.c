@@ -47,6 +47,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/prctl.h>
 
 DEBUG_GET_ONCE_LOG_OPTION(pimax_log, "PIMAX_LOG", U_LOGGING_INFO)
 //! TODO: the panels are mounted rotated by 90 deg (direction unknown). 0, 90, 180 or 270.
@@ -60,6 +61,7 @@ DEBUG_GET_ONCE_BOOL_OPTION(pimax_mirror_right, "PIMAX_MIRROR_RIGHT", false)
 DEBUG_GET_ONCE_NUM_OPTION(pimax_debug_div, "PIMAX_DEBUG_DIV", 1)
 DEBUG_GET_ONCE_NUM_OPTION(pimax_axis_mode, "PIMAX_AXIS_MODE", 1)
 //! Debug: do not open the headset (no USB access, no tracking): lens/compositor tests without hardware.
+DEBUG_GET_ONCE_BOOL_OPTION(pimax_debug_ptrace, "PIMAX_DEBUG_PTRACE", false)
 DEBUG_GET_ONCE_BOOL_OPTION(pimax_no_device, "PIMAX_NO_DEVICE", false)
 DEBUG_GET_ONCE_NUM_OPTION(pimax_bias_ms, "PIMAX_BIAS_MS", 2000)
 DEBUG_GET_ONCE_NUM_OPTION(pimax_bias_timeout_ms, "PIMAX_BIAS_TIMEOUT_MS", 3000)
@@ -524,6 +526,11 @@ pimax_hmd_create(struct xrt_device *out_ctrls[2])
 	}
 
 	hmd->log_level = debug_get_log_option_pimax_log();
+	if (debug_get_bool_option_pimax_debug_ptrace()) {
+		// yama ptrace_scope=1: lets a same-user gdb/eu-stack attach to a hung service
+		prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+		HMD_INFO(hmd, "PIMAX_DEBUG_PTRACE=1: same-user debuggers may attach to this process");
+	}
 	os_mutex_init(&hmd->clk_lock);
 	hmd->axis_mode = (int)debug_get_num_option_pimax_axis_mode();
 	long bias_ms = debug_get_num_option_pimax_bias_ms();
