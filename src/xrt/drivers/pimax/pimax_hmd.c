@@ -33,6 +33,7 @@
 
 #include "pimax.h"
 #include "pimax_interface.h"
+#include "pimax_lens.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -49,6 +50,8 @@ DEBUG_GET_ONCE_BOOL_OPTION(pimax_mirror_right, "PIMAX_MIRROR_RIGHT", false)
 //! Debug only: divide screen/view sizes so the windowed (XCB/Wayland) window fits a normal monitor.
 DEBUG_GET_ONCE_NUM_OPTION(pimax_debug_div, "PIMAX_DEBUG_DIV", 1)
 DEBUG_GET_ONCE_NUM_OPTION(pimax_axis_mode, "PIMAX_AXIS_MODE", 1)
+//! Debug: do not open the headset (no USB access, no tracking): lens/compositor tests without hardware.
+DEBUG_GET_ONCE_BOOL_OPTION(pimax_no_device, "PIMAX_NO_DEVICE", false)
 DEBUG_GET_ONCE_NUM_OPTION(pimax_bias_ms, "PIMAX_BIAS_MS", 2000)
 
 #define PIMAX_EYE_W 3552
@@ -67,6 +70,7 @@ struct pimax_hmd
 	struct m_imu_3dof fusion;
 
 	int axis_mode;
+	struct pimax_lens lens;
 
 	// Device clock -> monotonic clock.
 	bool have_clock;
@@ -318,6 +322,13 @@ pimax_hmd_get_visibility_mask(struct xrt_device *xdev,
 	return XRT_SUCCESS;
 }
 
+static xrt_result_t
+pimax_hmd_compute_distortion(struct xrt_device *xdev, uint32_t view, float u, float v, struct xrt_uv_triplet *result)
+{
+	struct pimax_hmd *hmd = (struct pimax_hmd *)xdev;
+	return pimax_lens_compute(&hmd->lens, view, u, v, result);
+}
+
 struct xrt_device *
 pimax_hmd_create(void)
 {
@@ -361,15 +372,10 @@ pimax_hmd_create(void)
 	hmd->base.hmd->screens[0].w_pixels = eye_w * 2;
 	hmd->base.hmd->screens[0].h_pixels = eye_h;
 
-	// Simple symmetric FOV, no lens data yet (doc: ~98 x 87 deg max).
-	const double hFOV = 98.0 * (M_PI / 180.0);
-	const double vFOV = 87.0 * (M_PI / 180.0);
-	if (!math_compute_fovs(1, 0.5, hFOV, 1, 0.5, vFOV, &hmd->base.hmd->distortion.fov[0]) ||
-	    !math_compute_fovs(1, 0.5, hFOV, 1, 0.5, vFOV, &hmd->base.hmd->distortion.fov[1])) {
-		HMD_ERROR(hmd, "Failed to compute FOVs");
-		u_device_free(&hmd->base);
-		return NULL;
-	}
+	// Lens model + FOV from ~/.config/pimax/lens.conf (or PIMAX_LENS_CONF), see analysis/lens-distortion.md.
+	pimax_lens_load(&hmd->lens, (float)PIMAX_EYE_H / (float)PIMAX_EYE_W);
+	hmd->base.hmd->distortion.fov[0] = pimax_lens_get_fov(&hmd->lens, 0);
+	hmd->base.hmd->distortion.fov[1] = pimax_lens_get_fov(&hmd->lens, 1);
 
 	/*
 	 * Panels are mounted rotated by 90 deg and mirror-symmetric: the left panel shows its half of the frame
@@ -413,8 +419,11 @@ pimax_hmd_create(void)
 		         hmd->base.hmd->views[eye].display.h_pixels, eye_w, eye_h);
 	}
 
-	// TODO: real lens distortion (Dream Air tables are GPL, must be re-measured).
-	u_distortion_mesh_set_none(&hmd->base);
+	// Distortion mesh from our own lens model (u, v arrive already in the pre-rotated, user-facing display space).
+	hmd->base.compute_distortion = pimax_hmd_compute_distortion;
+	hmd->base.hmd->distortion.models = XRT_DISTORTION_MODEL_COMPUTE;
+	hmd->base.hmd->distortion.preferred = XRT_DISTORTION_MODEL_COMPUTE;
+	u_distortion_mesh_fill_in_compute(&hmd->base);
 
 	m_relation_history_create(&hmd->relation_hist);
 	m_imu_3dof_init(&hmd->fusion, M_IMU_3DOF_USE_GRAVITY_DUR_20MS);
@@ -423,6 +432,12 @@ pimax_hmd_create(void)
 	struct xrt_space_relation identity = XRT_SPACE_RELATION_ZERO;
 	identity.relation_flags = XRT_SPACE_RELATION_ORIENTATION_VALID_BIT;
 	m_relation_history_push(hmd->relation_hist, &identity, os_monotonic_get_ns());
+
+	if (debug_get_bool_option_pimax_no_device()) {
+		HMD_WARN(hmd, "PIMAX_NO_DEVICE: headset not opened, identity pose");
+		u_var_add_root(hmd, "Pimax Dream Air (no device)", true);
+		return &hmd->base;
+	}
 
 	bias_restart(hmd);
 
