@@ -35,6 +35,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 DEBUG_GET_ONCE_LOG_OPTION(pimax_log, "PIMAX_LOG", U_LOGGING_INFO)
 //! TODO: the panels are mounted rotated by 90 deg (direction unknown). 0, 90, 180 or 270.
@@ -404,6 +405,24 @@ pimax_hmd_create(void)
 		HMD_ERROR(hmd, "Pimax headset did not connect within 5 s");
 		pimax_hmd_destroy(&hmd->base);
 		return NULL;
+	}
+
+	// Firmware only lights the panels after the video-prepare sequence and ~5.5 s of stable 72 Hz video.
+	// Also tell the keepalive service (pimax-keepalived) which rate to carry.
+	int prep = pimax_video_prepare(hmd->lib, 72);
+	HMD_INFO(hmd, "pimax_video_prepare(72) -> %d", prep);
+	const char *xdg = getenv("XDG_RUNTIME_DIR");
+	if (xdg != NULL) {
+		char path[512];
+		snprintf(path, sizeof(path), "%s/pimax-rate", xdg);
+		FILE *f = fopen(path, "w");
+		if (f != NULL) {
+			fputs("72\n", f);
+			fclose(f);
+			HMD_INFO(hmd, "wrote 72 to %s", path);
+		} else {
+			HMD_WARN(hmd, "could not write %s", path);
+		}
 	}
 
 	u_var_add_root(hmd, "Pimax Dream Air", true);
