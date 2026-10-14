@@ -7,6 +7,7 @@ set(tests
     tests_cxx_wrappers
     tests_deque
     tests_generic_callbacks
+    tests_gpu_wedge
     tests_glue_device
     tests_glue_frameserver
     tests_glue_traits

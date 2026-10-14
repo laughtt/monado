@@ -364,6 +364,15 @@ struct comp_target
 	                                   VkBool32 *out_supported);
 
 	/*!
+	 * Optional: give the display back to the system without using Vulkan, because a presented image never
+	 * finished flipping and the GPU is wedged (@ref u_gpu_wedge_set). Must not block on the GPU. After it the
+	 * target is not presented to again. Returns true if the display was released.
+	 *
+	 * NULL for targets that have nothing to release.
+	 */
+	bool (*release_display_wedged)(struct comp_target *ct);
+
+	/*!
 	 * Destroys this target.
 	 */
 	void (*destroy)(struct comp_target *ct);
@@ -706,6 +715,23 @@ comp_target_queue_supports_present(struct comp_target *ct, struct vk_bundle_queu
 {
 	COMP_TRACE_MARKER();
 	return ct->queue_supports_present(ct, queue, out_supported);
+}
+
+/*!
+ * @copydoc comp_target::release_display_wedged
+ *
+ * Helper for calling through the function pointer: does a null check, false if the target has nothing to release.
+ *
+ * @public @memberof comp_target
+ * @ingroup comp_main
+ */
+static inline bool
+comp_target_release_display_wedged(struct comp_target *ct)
+{
+	if (ct == NULL || ct->release_display_wedged == NULL) {
+		return false;
+	}
+	return ct->release_display_wedged(ct);
 }
 
 /*!

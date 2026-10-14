@@ -15,6 +15,7 @@
 #include "util/u_metrics.h"
 #include "util/u_logging.h"
 #include "util/u_trace_marker.h"
+#include "util/u_gpu_wedge.h"
 
 #ifdef XRT_OS_WINDOWS
 #include "util/u_windows.h"
@@ -23,6 +24,9 @@
 #include "server/ipc_server_interface.h"
 
 #include "target_lists.h"
+
+#include <stdio.h>
+#include <unistd.h>
 
 DEBUG_GET_ONCE_BOOL_OPTION(exit_on_disconnect, "IPC_EXIT_ON_DISCONNECT", false)
 
@@ -53,6 +57,17 @@ main(int argc, char *argv[])
 	int ret = ipc_server_main(argc, argv, &ismi);
 
 	u_metrics_close();
+
+	if (u_gpu_wedge_is_set()) {
+		/*
+		 * The teardown left the Vulkan objects of the stuck device alone; library destructors (the GPU driver's
+		 * included) must not get a chance to wait for that GPU either. The kernel frees everything.
+		 */
+		U_LOG_E("Leaving with _exit(%d): the GPU is wedged (%s).", ret, u_gpu_wedge_reason());
+		fflush(stdout);
+		fflush(stderr);
+		_exit(ret);
+	}
 
 	return ret;
 }

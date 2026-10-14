@@ -42,6 +42,10 @@ pimax_lens_destroy(struct pimax_lens *lens);
 struct xrt_fov
 pimax_lens_get_fov(const struct pimax_lens *lens, uint32_t view);
 
+//! Outward cant of each display in degrees (lens.conf cant_deg / PIMAX_CANT_DEG, default 0).
+float
+pimax_lens_get_cant_deg(const struct pimax_lens *lens);
+
 xrt_result_t
 pimax_lens_compute(const struct pimax_lens *lens, uint32_t view, float u, float v, struct xrt_uv_triplet *result);
 

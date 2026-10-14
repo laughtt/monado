@@ -77,6 +77,12 @@ pimax_lens_get_fov(const struct pimax_lens *lens, uint32_t view)
 	return fov;
 }
 
+float
+pimax_lens_get_cant_deg(const struct pimax_lens *lens)
+{
+	return lens->rs != NULL ? pimax_lens_rs_get_cant_deg(lens->rs) : 0.0f;
+}
+
 xrt_result_t
 pimax_lens_compute(const struct pimax_lens *lens, uint32_t view, float u, float v, struct xrt_uv_triplet *result)
 {

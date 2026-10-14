@@ -16,6 +16,7 @@
 #include "util/u_handles.h"
 #include "util/u_trace_marker.h"
 #include "util/u_limited_unique_id.h"
+#include "util/u_gpu_wedge.h"
 
 #include "vk/vk_cmd_pool.h"
 #include "vk/vk_compositor_flags.h"
@@ -677,6 +678,15 @@ void
 comp_swapchain_shared_garbage_collect(struct comp_swapchain_shared *cscs)
 {
 	struct comp_swapchain *sc;
+
+	/*
+	 * Destroying swapchain images starts with vkDeviceWaitIdle (image_cleanup), which never returns while the GPU
+	 * is wedged: the compositor thread (a client disconnecting) or the teardown would block in the driver. Keep the
+	 * swapchains queued instead, the kernel frees their memory when the process exits.
+	 */
+	if (u_gpu_wedge_is_set()) {
+		return;
+	}
 
 	while ((sc = u_threading_stack_pop(&cscs->destroy_swapchains))) {
 		sc->real_destroy(sc);

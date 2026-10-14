@@ -14,6 +14,10 @@
  * file only feeds it the decoded reports and runs Monado's u_hand_sim_simulate_generic on the result. The hand is
  * posed from the controller's grip pose through a fixed grip->wrist offset (also from pimax-hands).
  * PIMAX_CTRL_HANDS=0 turns it off, PIMAX_CTRL_HANDS_DEMO=1 replaces the reports by a scripted pattern (test aid).
+ * The reports are only queued (plain C, a small ring) on the libpimax session thread; the Rust filters run when a
+ * client asks for the hand joints (get_hand_tracking), so a session without hand tracking does no hand work at all
+ * (hang when worn, analysis/hang-worn-debug.md). PIMAX_CTRL_HANDS_FEED=report restores the old per-report feed on the
+ * session thread (A/B test only).
  *
  * @ingroup drv_pimax
  */
@@ -51,6 +55,7 @@ DEBUG_GET_ONCE_OPTION(pimax_ctrl_pose, "PIMAX_CTRL_POSE", "fixed")
 DEBUG_GET_ONCE_FLOAT_OPTION(pimax_ctrl_gyro_lsb_dps, "PIMAX_CTRL_GYRO_LSB_DPS", 16.4f)
 DEBUG_GET_ONCE_BOOL_OPTION(pimax_ctrl_hands, "PIMAX_CTRL_HANDS", true)
 DEBUG_GET_ONCE_BOOL_OPTION(pimax_ctrl_hands_demo, "PIMAX_CTRL_HANDS_DEMO", false)
+DEBUG_GET_ONCE_OPTION(pimax_ctrl_hands_feed, "PIMAX_CTRL_HANDS_FEED", "lazy")
 
 // Fixed offsets in the head-yaw frame (x right, y up, -z forward).
 #define OFF_SIDE 0.20f
@@ -60,6 +65,7 @@ DEBUG_GET_ONCE_BOOL_OPTION(pimax_ctrl_hands_demo, "PIMAX_CTRL_HANDS_DEMO", false
 #define ACTIVE_TIMEOUT_NS (1500ull * 1000 * 1000) // no report for this long -> inputs inactive
 #define REATTACH_MIN_NS (2500ull * 1000 * 1000)
 #define BIAS_SAMPLES 250 // ~1 s at 250 Hz
+#define HANDS_RING 128   // queued reports for the lazy hand feed: ~0.5 s at 250 Hz (older ones are dropped)
 
 enum
 {
@@ -89,6 +95,7 @@ struct pimax_ctrl_ctx
 	float gyro_scale; // rad/s per LSB
 	bool hands;       // controller-driven hand tracking (pimax-hands)
 	bool hands_demo;  // scripted input instead of reports (PIMAX_CTRL_HANDS_DEMO)
+	bool hands_eager; // PIMAX_CTRL_HANDS_FEED=report: feed Rust on the session thread (old behaviour)
 
 	struct pimax_controller *ctl[2]; // [0] left (slot 2), [1] right (slot 3)
 
@@ -121,6 +128,16 @@ struct pimax_controller
 	pimax_hands *hands;
 	pimax_hands_out hands_out;
 	struct xrt_pose grip_to_wrist; // wrist in the grip pose frame
+	// Lazy feed (lock): reports queued by the session thread, drained into pimax-hands by get_hand_tracking.
+	struct
+	{
+		uint64_t ns;
+		uint32_t buttons;
+		int16_t stick_x, stick_y;
+		uint8_t trigger, grip, touch;
+	} hq[HANDS_RING];
+	uint32_t hq_head;  // next write index
+	uint32_t hq_count; // queued, <= HANDS_RING
 
 	// IMU orientation (lock).
 	struct m_imu_3dof fusion;
@@ -346,6 +363,23 @@ pimax_ctl_get_tracked_pose(struct xrt_device *xdev,
 	return XRT_SUCCESS;
 }
 
+//! Lock held: feed the queued reports (oldest first) into pimax-hands and refresh hands_out.
+static void
+hands_drain_locked(struct pimax_controller *c)
+{
+	if (c->hands == NULL || c->hq_count == 0) {
+		return;
+	}
+	uint32_t start = (c->hq_head + HANDS_RING - c->hq_count) % HANDS_RING;
+	for (uint32_t k = 0; k < c->hq_count; k++) {
+		const uint32_t i = (start + k) % HANDS_RING;
+		pimax_hands_update_report(c->hands, c->hq[i].ns, c->hq[i].trigger, c->hq[i].grip, c->hq[i].stick_x,
+		                          c->hq[i].stick_y, c->hq[i].buttons, c->hq[i].touch);
+	}
+	c->hq_count = 0;
+	pimax_hands_get(c->hands, &c->hands_out);
+}
+
 //! Fill the joint set of this hand from the Rust curl state; the hand follows the grip pose.
 static xrt_result_t
 pimax_ctl_get_hand_tracking(struct xrt_device *xdev,
@@ -372,6 +406,8 @@ pimax_ctl_get_hand_tracking(struct xrt_device *xdev,
 		pimax_hands_update(c->hands, now, &demo);
 		pimax_hands_get(c->hands, &c->hands_out);
 		active = true;
+	} else {
+		hands_drain_locked(c);
 	}
 	ho = c->hands_out;
 	pthread_mutex_unlock(&c->lock);
@@ -519,9 +555,23 @@ pimax_ctrl_on_report(struct pimax_ctrl_ctx *ctx, const pimax_controller_report *
 	c->t_stick = (r->touch & PIMAX_TOUCH_STICK) != 0;
 	c->raw46 = r->raw[46];
 	if (c->hands != NULL && !ctx->hands_demo) {
-		// Bit meanings (touch, buttons), normalisation, filters and the thumb state machine are all in Rust.
-		pimax_hands_update_report(c->hands, now, r->trigger, r->grip, r->stick_x, r->stick_y, r->buttons, r->touch);
-		pimax_hands_get(c->hands, &c->hands_out);
+		// Bit meanings (touch, buttons), normalisation, filters and the thumb state machine are all in Rust. Only
+		// queue the report here (session thread); get_hand_tracking runs the filters when a client wants hands.
+		const uint32_t i = c->hq_head;
+		c->hq[i].ns = now;
+		c->hq[i].buttons = r->buttons;
+		c->hq[i].stick_x = (int16_t)r->stick_x;
+		c->hq[i].stick_y = (int16_t)r->stick_y;
+		c->hq[i].trigger = r->trigger;
+		c->hq[i].grip = r->grip;
+		c->hq[i].touch = r->touch;
+		c->hq_head = (i + 1) % HANDS_RING;
+		if (c->hq_count < HANDS_RING) {
+			c->hq_count++;
+		}
+		if (ctx->hands_eager) {
+			hands_drain_locked(c);
+		}
 	}
 	if (ctx->imu_mode) {
 		imu_update(c, r, now);
@@ -750,6 +800,8 @@ pimax_ctrl_create(struct xrt_device *head, enum u_logging_level log_level, struc
 	ctx->gyro_scale = (float)(M_PI / 180.0) / (lsb > 0.0f ? lsb : 16.4f);
 	ctx->hands = debug_get_bool_option_pimax_ctrl_hands();
 	ctx->hands_demo = ctx->hands && debug_get_bool_option_pimax_ctrl_hands_demo();
+	const char *feed = debug_get_option_pimax_ctrl_hands_feed();
+	ctx->hands_eager = ctx->hands && feed != NULL && strcmp(feed, "report") == 0;
 	if (ctx->hands && pimax_hands_abi_version() != PIMAX_HANDS_ABI_VERSION) {
 		U_LOG_IFL_E(log_level, "pimax-hands ABI %u != header %u: stale libpimax_capi.a, hand tracking off",
 		            pimax_hands_abi_version(), PIMAX_HANDS_ABI_VERSION);
@@ -766,6 +818,9 @@ pimax_ctrl_create(struct xrt_device *head, enum u_logging_level log_level, struc
 	}
 	U_LOG_IFL_I(log_level, "Pimax controllers: pose mode %s%s, hand tracking %s", ctx->imu_mode ? "imu" : "fixed",
 	            ctx->imu_mode ? " (gyro scale is a guess)" : "",
-	            ctx->hands ? (ctx->hands_demo ? "on (DEMO pattern)" : "on (data source: controller)") : "off");
+	            ctx->hands ? (ctx->hands_demo ? "on (DEMO pattern)"
+	                                          : (ctx->hands_eager ? "on (data source: controller, feed per report)"
+	                                                              : "on (data source: controller, lazy feed)"))
+	                       : "off");
 	return ctx;
 }
