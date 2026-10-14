@@ -12,6 +12,7 @@
 #include "os/os_threading.h"
 
 #include "util/u_misc.h"
+#include "util/u_gpu_wedge.h"
 #include "util/u_pacing.h"
 #include "util/u_debug.h"
 #include "util/u_time.h"
@@ -1274,6 +1275,19 @@ comp_target_swapchain_cleanup(struct comp_target_swapchain *cts)
 		// Destroy also stops the thread.
 		os_thread_helper_destroy(&cts->vblank.event_thread);
 		cts->vblank.thread_running = false;
+	}
+
+	if (u_gpu_wedge_is_set()) {
+		/*
+		 * A present never retired: vkDestroySwapchainKHR waits for it inside the driver, and the image views and
+		 * semaphores are still referenced by it. Leak them, the process exit frees them (u_gpu_wedge.h).
+		 */
+		COMP_ERROR(cts->base.c, "GPU wedged (%s): leaking the swapchain, its views and semaphores.",
+		           u_gpu_wedge_reason());
+		cts->swapchain.handle = VK_NULL_HANDLE;
+		cts->surface.handle = VK_NULL_HANDLE;
+		u_pc_destroy(&cts->upc);
+		return;
 	}
 
 	destroy_image_views(cts);

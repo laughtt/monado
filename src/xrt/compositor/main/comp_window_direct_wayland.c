@@ -22,13 +22,38 @@
 #include "xrt/xrt_compiler.h"
 #include "main/comp_window.h"
 #include "main/comp_window_direct.h"
+#include "os/os_time.h"
 #include "util/u_debug.h"
+#include "util/u_gpu_wedge.h"
 
 #ifndef VK_EXT_acquire_drm_display
 #error "Wayland direct requires the Vulkan extension VK_EXT_acquire_drm_display"
 #endif
 
 DEBUG_GET_ONCE_OPTION(requested_connector, "XRT_COMPOSITOR_WAYLAND_CONNECTOR", NULL)
+
+/*
+ * nvidia-drm UAPI, from kernel-open/nvidia-drm/nv_drm_common_ioctl.h of the NVIDIA open kernel modules (unchanged
+ * since the 470 series). vkAcquireDrmDisplayEXT on NVIDIA grants the leased connector to the driver's NVKMS client
+ * with DRM_IOCTL_NVIDIA_GRANT_PERMISSIONS on the lease fd; this is the matching revoke.
+ */
+struct comp_nv_drm_get_dpy_id_for_connector_id_params
+{
+	uint32_t connectorId; /* IN */
+	uint32_t dpyId;       /* OUT */
+};
+
+struct comp_nv_drm_revoke_permissions_params
+{
+	uint32_t dpyId; /* IN */
+	uint32_t type;  /* IN */
+};
+
+#define COMP_NV_DRM_PERMISSIONS_TYPE_MODESET 2
+#define COMP_DRM_IOCTL_NVIDIA_GET_DPY_ID_FOR_CONNECTOR_ID                                                              \
+	DRM_IOWR((DRM_COMMAND_BASE + 0x10), struct comp_nv_drm_get_dpy_id_for_connector_id_params)
+#define COMP_DRM_IOCTL_NVIDIA_REVOKE_PERMISSIONS                                                                       \
+	DRM_IOWR((DRM_COMMAND_BASE + 0x13), struct comp_nv_drm_revoke_permissions_params)
 
 struct direct_wayland_lease
 {
@@ -75,6 +100,9 @@ struct comp_window_direct_wayland
 	struct direct_wayland_lease_connector *selected_connector;
 
 	VkDisplayKHR vk_display;
+
+	//! The display was given back after a stuck flip (release_display_wedged), never present to it again.
+	bool display_released;
 };
 
 static void
@@ -106,12 +134,93 @@ get_vk(struct comp_window_direct_wayland *cww)
 	return &cww->base.base.c->base.vk;
 }
 
+/*!
+ * Give the leased display back without Vulkan after a flip got stuck (comp_target::release_display_wedged).
+ *
+ * On NVIDIA the Vulkan driver flips through its own NVKMS client, which vkAcquireDrmDisplayEXT gave modeset
+ * permission for the leased connector. That permission is normally revoked when the lease file is released. When the
+ * process is SIGKILLed instead, nvidia-drm can skip that revoke (it takes the modeset locks interruptibly while the
+ * fatal signal is pending), the connector stays granted to a dead file, and every later vkAcquireDrmDisplayEXT fails
+ * with VK_ERROR_INITIALIZATION_FAILED until the module is reloaded (analysis/nvidia-flip-hang.md). Revoking it here,
+ * from a live process, cannot be skipped like that, and asks NVKMS to shut the head down. The ioctl may take a few
+ * seconds on a driver without the 2Heads1OR idle fix (it tries to idle the stuck window channels first).
+ */
+static bool
+comp_window_direct_wayland_release_display_wedged(struct comp_target *ct)
+{
+	struct comp_window_direct_wayland *w = (struct comp_window_direct_wayland *)ct;
+
+	if (w->display_released) {
+		return true;
+	}
+
+	if (w->lease == NULL || w->lease->leased_fd < 0 || w->selected_connector == NULL) {
+		COMP_ERROR(ct->c, "release display: there is no lease to release.");
+		return false;
+	}
+
+	const int fd = w->lease->leased_fd;
+
+	drmVersionPtr version = drmGetVersion(fd);
+	const bool is_nvidia = version != NULL && version->name != NULL && strcmp(version->name, "nvidia-drm") == 0;
+	drmFreeVersion(version);
+
+	if (!is_nvidia) {
+		COMP_WARN(ct->c, "release display: not nvidia-drm, nothing to revoke; the lease is released at exit.");
+		return false;
+	}
+
+	struct comp_nv_drm_get_dpy_id_for_connector_id_params dpy = {
+	    .connectorId = w->selected_connector->id,
+	};
+	if (drmIoctl(fd, COMP_DRM_IOCTL_NVIDIA_GET_DPY_ID_FOR_CONNECTOR_ID, &dpy) != 0) {
+		COMP_ERROR(ct->c, "release display: DRM_IOCTL_NVIDIA_GET_DPY_ID_FOR_CONNECTOR_ID(%u): %s",
+		           w->selected_connector->id, strerror(errno));
+		return false;
+	}
+
+	struct comp_nv_drm_revoke_permissions_params revoke = {
+	    .dpyId = dpy.dpyId,
+	    .type = COMP_NV_DRM_PERMISSIONS_TYPE_MODESET,
+	};
+	const uint64_t start_ns = os_monotonic_get_ns();
+	const int ret = drmIoctl(fd, COMP_DRM_IOCTL_NVIDIA_REVOKE_PERMISSIONS, &revoke);
+	const double took_s = (double)(os_monotonic_get_ns() - start_ns) / 1e9;
+
+	if (ret != 0) {
+		COMP_ERROR(ct->c, "release display: DRM_IOCTL_NVIDIA_REVOKE_PERMISSIONS(dpy 0x%08x): %s (%.1f s)",
+		           dpy.dpyId, strerror(errno), took_s);
+		return false;
+	}
+
+	// The Vulkan driver lost its permission for the head: it is never presented to again from this process.
+	w->display_released = true;
+
+	COMP_ERROR(ct->c,
+	           "Released the NVIDIA modeset permission of connector %u (%s, dpy 0x%08x) after a stuck flip (%.1f s). "
+	           "The display stays dark until the service is restarted.",
+	           w->selected_connector->id, w->selected_connector->name, dpy.dpyId, took_s);
+
+	return true;
+}
+
 static void
 comp_window_direct_wayland_destroy(struct comp_target *w)
 {
 	struct comp_window_direct_wayland *w_wayland = (struct comp_window_direct_wayland *)w;
 
+	if (u_gpu_wedge_is_set()) {
+		// Before anything else, while the lease fd is open: without Vulkan, safe while the GPU is stuck.
+		comp_window_direct_wayland_release_display_wedged(w);
+	}
+
+	// Leaks the Vulkan swapchain objects instead of destroying them while the GPU is wedged.
 	comp_target_swapchain_cleanup(&w_wayland->base);
+
+	if (u_gpu_wedge_is_set()) {
+		// vkReleaseDisplayEXT talks to the stuck driver as well; the process exit releases the display.
+		w_wayland->vk_display = VK_NULL_HANDLE;
+	}
 
 	if (w_wayland->vk_display != VK_NULL_HANDLE) {
 		struct vk_bundle *vk = get_vk(w_wayland);
@@ -513,6 +622,7 @@ comp_window_direct_wayland_create(struct comp_compositor *c)
 	w->base.base.name = "wayland-direct";
 	w->base.display = VK_NULL_HANDLE;
 	w->base.base.destroy = comp_window_direct_wayland_destroy;
+	w->base.base.release_display_wedged = comp_window_direct_wayland_release_display_wedged;
 	w->base.base.flush = comp_window_direct_wayland_flush;
 	w->base.base.init_pre_vulkan = comp_window_direct_wayland_init;
 	w->base.base.init_post_vulkan = comp_window_direct_wayland_init_swapchain;

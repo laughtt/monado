@@ -54,6 +54,7 @@
 
 #include "util/u_var.h"
 #include "util/u_misc.h"
+#include "util/u_gpu_wedge.h"
 #include "util/u_time.h"
 #include "util/u_debug.h"
 #include "util/u_pacing.h"
@@ -417,6 +418,21 @@ compositor_destroy(struct xrt_compositor *xc)
 
 	// Need to do this as early as possible.
 	u_var_remove_root(c);
+
+	if (u_gpu_wedge_is_set()) {
+		/*
+		 * A flip or GPU work never completed. Everything below waits for the GPU somewhere inside the driver
+		 * (vkDeviceWaitIdle in the swapchain image cleanup, destroying images and memory that pending work uses,
+		 * vkDestroyDevice), so it would block forever and the service would have to be SIGKILLed, which can leave
+		 * the display wedged until a reboot (analysis/nvidia-flip-hang.md). Leak the Vulkan objects instead: the
+		 * kernel frees them when the process exits, and the service leaves with _exit() (u_gpu_wedge.h). The
+		 * target still gives the display back and closes its file descriptors, without Vulkan.
+		 */
+		COMP_ERROR(c, "GPU wedged (%s): skipping the Vulkan teardown, the process exit frees it.",
+		           u_gpu_wedge_reason());
+		comp_target_destroy(&c->target);
+		return;
+	}
 
 	// Destroy any Vulkan resources, even if not used.
 	chl_scratch_free_resources(&c->scratch, &c->nr);

@@ -31,6 +31,7 @@
 #include "util/u_frame_times_widget.h"
 #include "util/u_debug.h"
 #include "util/u_time.h"
+#include "util/u_gpu_wedge.h"
 
 #include "util/comp_render.h"
 #include "util/comp_high_level_render.h"
@@ -54,6 +55,7 @@
 #include <math.h>
 #include <unistd.h>
 #include <inttypes.h>
+#include <signal.h>
 
 DEBUG_GET_ONCE_LOG_OPTION(comp_frame_lag_level, "XRT_COMP_FRAME_LAG_LOG_AS_LEVEL", U_LOGGING_WARN)
 /*!
@@ -62,6 +64,16 @@ DEBUG_GET_ONCE_LOG_OPTION(comp_frame_lag_level, "XRT_COMP_FRAME_LAG_LOG_AS_LEVEL
  * it the shutdown (analysis/hang-worn-debug.md).
  */
 DEBUG_GET_ONCE_NUM_OPTION(comp_gpu_wait_timeout_s, "XRT_COMPOSITOR_GPU_WAIT_TIMEOUT_S", 3)
+/*!
+ * When a wait gives up and the frame's GPU work is done (so the present/flip is what never retired): give the
+ * display back right away, without Vulkan (comp_target::release_display_wedged), so that a later SIGKILL of the
+ * service cannot leave it granted to a dead process. The display then stays dark until the service is restarted.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(comp_stuck_flip_release, "XRT_COMPOSITOR_STUCK_FLIP_RELEASE", true)
+/*!
+ * After releasing the display on a stuck flip, also ask the service to shut down (as if it got SIGTERM).
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(comp_stuck_flip_exit, "XRT_COMPOSITOR_STUCK_FLIP_EXIT", false)
 #define LOG_FRAME_LAG(...) U_LOG_IFL(debug_get_log_option_comp_frame_lag_level(), u_log_get_global_level(), __VA_ARGS__)
 
 /*
@@ -192,6 +204,9 @@ struct comp_renderer
 	uint64_t stuck_since_ns;
 	uint64_t stuck_skipped_frames;
 
+	//! The display was given back after a stuck flip: never render or present again (emulated frames only).
+	bool display_released;
+
 	//! @}
 };
 
@@ -220,15 +235,61 @@ renderer_frame_gpu_state(struct comp_renderer *r)
 	}
 }
 
+//! True if the GPU timestamps of the last frame are written, i.e. its compositor work finished (non-blocking).
+static bool
+renderer_frame_gpu_work_done(struct comp_renderer *r)
+{
+	struct vk_bundle *vk = &r->c->base.vk;
+	if (r->c->nr.query_pool == VK_NULL_HANDLE) {
+		return false;
+	}
+	uint64_t ts[2] = {0};
+	VkResult ret = vk->vkGetQueryPoolResults(vk->device, r->c->nr.query_pool, 0, 2, sizeof(ts), ts,
+	                                         sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+	return ret == VK_SUCCESS;
+}
+
+/*!
+ * A bounded wait just gave up. From now on nothing may wait for the GPU (u_gpu_wedge.h): the teardown leaks the
+ * Vulkan objects and the service leaves with _exit(). If the frame's own GPU work is done, the flip of the presented
+ * image is what never retires (analysis/nvidia-flip-hang.md): release the display while the process is alive.
+ */
+static void
+renderer_on_gpu_stuck(struct comp_renderer *r)
+{
+	const bool flip_stuck = renderer_frame_gpu_work_done(r);
+
+	u_gpu_wedge_set(flip_stuck ? "a presented image never finished flipping" : "compositor GPU work did not finish");
+
+	if (!flip_stuck || r->display_released) {
+		return;
+	}
+
+	if (!debug_get_bool_option_comp_stuck_flip_release()) {
+		COMP_ERROR(r->c, "Stuck flip: not releasing the display (XRT_COMPOSITOR_STUCK_FLIP_RELEASE=0). Stop the "
+		                 "service with SIGINT and let it exit by itself; a SIGKILL can wedge the display.");
+		return;
+	}
+
+	if (comp_target_release_display_wedged(r->c->target)) {
+		r->display_released = true;
+	}
+
+	if (debug_get_bool_option_comp_stuck_flip_exit()) {
+		COMP_ERROR(r->c, "Stuck flip: shutting the service down (XRT_COMPOSITOR_STUCK_FLIP_EXIT).");
+		raise(SIGTERM);
+	}
+}
+
 /*!
  * While a wait has given up: true if the stuck fence is still pending (the caller must not submit or touch GPU
- * resources), false once it signalled (state cleared).
+ * resources), false once it signalled (state cleared). Always true once the display was released.
  */
 static bool
 renderer_gpu_still_stuck(struct comp_renderer *r)
 {
 	if (!r->gpu_stuck) {
-		return false;
+		return r->display_released;
 	}
 	struct vk_bundle *vk = &r->c->base.vk;
 	VkResult ret = vk->vkGetFenceStatus(vk->device, r->stuck_fence);
@@ -236,12 +297,18 @@ renderer_gpu_still_stuck(struct comp_renderer *r)
 		r->stuck_skipped_frames++;
 		return true;
 	}
-	COMP_ERROR(r->c, "GPU work completed again after %.1f s (%s), %" PRIu64 " frames skipped; resuming.",
+	COMP_ERROR(r->c, "GPU work completed again after %.1f s (%s), %" PRIu64 " frames skipped%s.",
 	           (double)(os_monotonic_get_ns() - r->stuck_since_ns) / 1e9, vk_result_string(ret),
-	           r->stuck_skipped_frames);
+	           r->stuck_skipped_frames,
+	           r->display_released ? "; the display was released, not presenting again" : "; resuming");
 	r->gpu_stuck = false;
 	r->stuck_fence = VK_NULL_HANDLE;
 	r->stuck_skipped_frames = 0;
+	if (r->display_released) {
+		// Keep the wedge: the target was not destroyed through Vulkan and must not be.
+		return true;
+	}
+	u_gpu_wedge_clear();
 	return false;
 }
 
@@ -279,6 +346,7 @@ renderer_wait_fence_bounded(struct comp_renderer *r, VkFence fence, const char *
 			r->stuck_fence = fence;
 			r->stuck_since_ns = start_ns;
 			r->stuck_skipped_frames = 0;
+			renderer_on_gpu_stuck(r);
 			return false;
 		}
 	}
