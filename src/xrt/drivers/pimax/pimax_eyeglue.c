@@ -67,7 +67,51 @@ struct pimax_eyeglue
 	struct os_mutex lock; //!< guards eye, users
 	pimax_eye *eye;
 	int users;
+	//! Diagnostics window (lock): get_gaze outcomes since stat_start_ns, logged every 5 s.
+	uint64_t stat_start_ns;
+	uint32_t st_calls, st_ok, st_none, st_stale, st_invalid;
+	uint64_t st_first_seq, st_last_seq;
+	bool st_have_seq;
 };
+
+//! Lock held: count one get_gaze outcome and log the window every 5 s while the pose is being asked for.
+static void
+stats_note_locked(struct pimax_eyeglue *g, int r, uint32_t flags, uint64_t seq)
+{
+	uint64_t now = os_monotonic_get_ns();
+	if (g->stat_start_ns == 0) {
+		g->stat_start_ns = now;
+	}
+	g->st_calls++;
+	if (r == PIMAX_EYE_NO_SAMPLE || r == PIMAX_EYE_BAD_ARG) {
+		g->st_none++;
+	} else {
+		if (!g->st_have_seq) {
+			g->st_first_seq = seq;
+			g->st_have_seq = true;
+		}
+		g->st_last_seq = seq;
+		if (r == PIMAX_EYE_STALE) {
+			g->st_stale++;
+		} else if ((flags & PIMAX_EYE_GAZE_VALID) == 0) {
+			g->st_invalid++;
+		} else {
+			g->st_ok++;
+		}
+	}
+	double secs = (double)(now - g->stat_start_ns) / 1e9;
+	if (secs < 5.0) {
+		return;
+	}
+	U_LOG_IFL_I(g->log_level,
+	            "Pimax eye: state %d, %u gaze queries in %.1f s: %u valid, %u invalid (eyes lost), %u stale, %u no sample; "
+	            "chip samples %.0f/s",
+	            g->eye != NULL ? pimax_eye_state(g->eye) : -1, g->st_calls, secs, g->st_ok, g->st_invalid,
+	            g->st_stale, g->st_none, g->st_have_seq ? (double)(g->st_last_seq - g->st_first_seq) / secs : 0.0);
+	g->stat_start_ns = now;
+	g->st_calls = g->st_ok = g->st_none = g->st_stale = g->st_invalid = 0;
+	g->st_have_seq = false;
+}
 
 bool
 pimax_eyeglue_enabled(void)
@@ -173,7 +217,10 @@ pimax_eyeglue_get_gaze(struct pimax_eyeglue *g, int64_t at_ns, struct xrt_pose *
 	pimax_eye_sample s;
 	int r;
 	os_mutex_lock(&g->lock);
+	s.flags = 0;
+	s.seq = 0;
 	r = pimax_eye_sample_at(g->eye, at_ns, &s); // NULL handle -> PIMAX_EYE_BAD_ARG
+	stats_note_locked(g, r, s.flags, s.seq);
 	os_mutex_unlock(&g->lock);
 	if (r != PIMAX_EYE_OK || (s.flags & PIMAX_EYE_GAZE_VALID) == 0) {
 		return false;

@@ -126,6 +126,7 @@ struct pimax_controller
 
 	// Hand tracking (lock): Rust state (curl filters, thumb state machine) and its latest result.
 	pimax_hands *hands;
+	bool hand_active_logged; // last activity reported by get_hand_tracking (log on change)
 	pimax_hands_out hands_out;
 	struct xrt_pose grip_to_wrist; // wrist in the grip pose frame
 	// Lazy feed (lock): reports queued by the session thread, drained into pimax-hands by get_hand_tracking.
@@ -410,6 +411,12 @@ pimax_ctl_get_hand_tracking(struct xrt_device *xdev,
 		hands_drain_locked(c);
 	}
 	ho = c->hands_out;
+	if (active != c->hand_active_logged) {
+		c->hand_active_logged = active;
+		U_LOG_IFL_I(c->ctx->log_level, "hand tracking %s: %s (last report %.1f s ago)", left ? "left" : "right",
+		            active ? "active" : "inactive (no controller report)",
+		            c->have_report ? (double)(now - c->last_report_ns) / 1e9 : -1.0);
+	}
 	pthread_mutex_unlock(&c->lock);
 
 	// Wrist = grip pose * fixed offset (the joint set is expressed relative to its hand_pose, in tracking-origin space).
