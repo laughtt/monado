@@ -454,6 +454,10 @@ track_thread(void *arg)
 				if (c == NULL || c->fuse == NULL || h->frame_ns == 0 || h->frame_ns == seen[i]) {
 					continue;
 				}
+				if (now > h->frame_ns + 2000ull * 1000 * 1000) {
+					seen[i] = h->frame_ns; // left over from an earlier tracker run
+					continue;
+				}
 				seen[i] = h->frame_ns;
 				struct xrt_pose body_aim = {
 				    .orientation = {h->quat[0], h->quat[1], h->quat[2], h->quat[3]},
@@ -1068,6 +1072,8 @@ pimax_ctrl_create(struct xrt_device *head, enum u_logging_level log_level, struc
 		out_devs[i] = &ctx->ctl[i]->base;
 	}
 	if (ctx->track) {
+		// body model: the hands see each other (never closer than 8 cm)
+		pimax_ctrlfuse_link(ctx->ctl[0]->fuse, ctx->ctl[1]->fuse);
 		atomic_store(&ctx->track_stop, false);
 		if (pthread_create(&ctx->track_thread, NULL, track_thread, ctx) == 0) {
 			ctx->track_thread_running = true;
