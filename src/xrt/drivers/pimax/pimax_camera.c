@@ -38,13 +38,17 @@ pimax_camera_create(struct xrt_device *hmd,
                     pimax_camera_clock_fn clock,
                     void *clock_user,
                     pimax_camera_orient_fn orient,
-                    void *orient_user)
+                    void *orient_user,
+                    pimax_camera_send_fn send,
+                    void *send_user)
 {
 	(void)hmd;
 	(void)clock;
 	(void)clock_user;
 	(void)orient;
 	(void)orient_user;
+	(void)send;
+	(void)send_user;
 	const char *hands = debug_get_option_pimax_hands_stub();
 	if (hands != NULL || debug_get_bool_option_pimax_cam_stub() || debug_get_bool_option_pimax_slam_stub() ||
 	    debug_get_option_pimax_slam_record_stub() != NULL) {
@@ -149,6 +153,14 @@ DEBUG_GET_ONCE_OPTION(pimax_slam_cams, "PIMAX_SLAM_CAMS", "0,1")
 DEBUG_GET_ONCE_OPTION(pimax_slam_record, "PIMAX_SLAM_RECORD", NULL)
 DEBUG_GET_ONCE_NUM_OPTION(pimax_slam_cam_offset_us, "PIMAX_SLAM_CAM_OFFSET_US", 0)
 DEBUG_GET_ONCE_OPTION(pimax_slam_imu, "PIMAX_SLAM_IMU", NULL)
+DEBUG_GET_ONCE_OPTION(pimax_cam_ae, "PIMAX_CAM_AE", NULL)
+
+enum ae_mode
+{
+	AE_OFF = 0,
+	AE_DRY = 1,  //!< controller runs, nothing is sent
+	AE_SEND = 2, //!< exposure push sent through pc->send
+};
 
 //! Basalt's world is z-up (gravity -z); OpenXR is y-up: rotate -90 deg about X (same fix as the Rift S driver).
 static const struct xrt_quat SLAM_TO_YUP = {0.70710678f, 0.0f, 0.0f, -0.70710678f};
@@ -224,6 +236,16 @@ struct pimax_camera
 	uint64_t slam_frames, slam_untimed, imu_pushed;
 	char slam_status[128];
 	struct u_var_button recenter_btn;
+	int64_t last_info_ns;
+
+	//! Auto-exposure (PIMAX_CAM_AE): Rust controller, the HMD sends.
+	pimax_camera_send_fn send;
+	void *send_user;
+	enum ae_mode ae_mode;
+	pimax_cam_ae *ae;
+	pimax_cam_ae_out ae_out;
+	uint64_t ae_sent, ae_send_errors;
+	char ae_status[160];
 };
 
 static void
@@ -441,6 +463,36 @@ poll_mercury(struct pimax_camera *pc)
 #endif
 }
 
+//! One tracking frame through the auto-exposure controller; sends only in AE_SEND mode.
+static void
+ae_step(struct pimax_camera *pc, int64_t now)
+{
+	if (pc->ae == NULL) {
+		return;
+	}
+	pimax_cam_ae_out *o = &pc->ae_out;
+	int r = pimax_cam_ae_update(pc->ae, pc->cam, (uint64_t)now, o);
+	if (r < 0) {
+		return;
+	}
+	if (o->changed) {
+		CAM_DEBUG(pc, "AE: target exposure %u/%u %u/%u gain %u/%u %u/%u (frame %u/%u, mean %.0f/%.0f, sat %.3f/%.3f)",
+		          o->exposure[0], o->exposure[2], o->exposure[1], o->exposure[3], o->gain[0], o->gain[2], o->gain[1],
+		          o->gain[3], o->frame_exposure[0], o->frame_gain[0], o->mean[0], o->mean[1], o->sat[0], o->sat[1]);
+	}
+	if (r == 1 && pc->ae_mode == AE_SEND && pc->send != NULL) {
+		if (pc->send(pc->send_user, PIMAX_CAM_AE_CMD, PIMAX_CAM_AE_OPT, o->payload, PIMAX_CAM_AE_PAYLOAD_LEN) == 0) {
+			pc->ae_sent++;
+		} else if (pc->ae_send_errors++ % 50 == 0) {
+			CAM_WARN(pc, "AE: exposure push failed (%" PRIu64 " errors)", pc->ae_send_errors);
+		}
+	}
+	snprintf(pc->ae_status, sizeof(pc->ae_status),
+	         "%s: lower %u/%u mean %.0f, upper %u/%u mean %.0f; frame %u/%u; %" PRIu64 " changes, %" PRIu64 " sent",
+	         pc->ae_mode == AE_SEND ? "on" : "dry", o->exposure[0], o->gain[0], o->mean[0], o->exposure[2],
+	         o->gain[2], o->mean[1], o->frame_exposure[0], o->frame_gain[0], o->changes, pc->ae_sent);
+}
+
 static void
 update_stats(struct pimax_camera *pc, int64_t now)
 {
@@ -466,6 +518,26 @@ update_stats(struct pimax_camera *pc, int64_t now)
 		         pc->slam_frames, pc->imu_pushed, pc->slam_untimed, pc->slam_on ? "; " : "",
 		         pc->slam_on ? pc->slam_status : "");
 	}
+	if (pc->ae != NULL) {
+		CAM_INFO(pc, "AE %s", pc->ae_status);
+	}
+	if (pc->slam_on && pc->track != NULL) {
+		pimax_cam_track_info ti;
+		os_mutex_lock(&pc->slam_lock);
+		int ok = pimax_cam_track_get_info(pc->track, &ti);
+		os_mutex_unlock(&pc->slam_lock);
+		if (ok == 0) {
+			CAM_INFO(pc,
+			         "6DoF output: gyro bias (%.3f %.3f %.3f) deg/s, correction %.1f mm / %.2f deg (max %.1f mm / "
+			         "%.2f deg), %" PRIu64 " blended, %" PRIu64 " snapped",
+			         ti.gyro_bias[0] * 57.2958, ti.gyro_bias[1] * 57.2958, ti.gyro_bias[2] * 57.2958,
+			         sqrt(ti.corr_pos[0] * ti.corr_pos[0] + ti.corr_pos[1] * ti.corr_pos[1] +
+			              ti.corr_pos[2] * ti.corr_pos[2]) * 1000.0,
+			         sqrt(ti.corr_rot[0] * ti.corr_rot[0] + ti.corr_rot[1] * ti.corr_rot[1] +
+			              ti.corr_rot[2] * ti.corr_rot[2]) * 57.2958,
+			         ti.max_corr_pos * 1000.0, ti.max_corr_rot * 57.2958, ti.blended, ti.snapped);
+		}
+	}
 	if (pc->stats_ht) {
 		CAM_INFO(pc, "mercury: %.2f processed pairs/s (SLAM placeholder got %" PRIu64 "/%" PRIu64 " frames)",
 		         pc->mercury_fps, pc->slam_stub_frames[0], pc->slam_stub_frames[1]);
@@ -488,12 +560,6 @@ update_stats(struct pimax_camera *pc, int64_t now)
  * 6DoF: SLAM tracker, supervisor, recorder.
  *
  */
-
-static void
-quat_d(const double q[4], struct xrt_quat *out)
-{
-	*out = (struct xrt_quat){(float)q[0], (float)q[1], (float)q[2], (float)q[3]};
-}
 
 //! Tracker relation (z-up world) -> y-up world, in place.
 static void
@@ -519,8 +585,8 @@ track_state_name(uint32_t s)
 static void
 slam_poll_locked(struct pimax_camera *pc, int64_t now_ns)
 {
-	pimax_cam_track_sample smp;
-	const pimax_cam_track_sample *sp = NULL;
+	pimax_cam_track_vio smp;
+	const pimax_cam_track_vio *sp = NULL;
 	int64_t ts = 0;
 	struct xrt_space_relation r = XRT_SPACE_RELATION_ZERO;
 	struct xrt_quat q3;
@@ -534,6 +600,9 @@ slam_poll_locked(struct pimax_camera *pc, int64_t now_ns)
 		smp.q[1] = r.pose.orientation.y;
 		smp.q[2] = r.pose.orientation.z;
 		smp.q[3] = r.pose.orientation.w;
+		smp.vel[0] = r.linear_velocity.x;
+		smp.vel[1] = r.linear_velocity.y;
+		smp.vel[2] = r.linear_velocity.z;
 		smp.q3dof[0] = q3.x;
 		smp.q3dof[1] = q3.y;
 		smp.q3dof[2] = q3.z;
@@ -541,13 +610,13 @@ slam_poll_locked(struct pimax_camera *pc, int64_t now_ns)
 		sp = &smp;
 	}
 	pimax_cam_track_out o;
-	if (pimax_cam_track_update(pc->track, (uint64_t)now_ns, sp, &o) != 0) {
+	if (pimax_cam_track_update_vio(pc->track, (uint64_t)now_ns, sp, &o) != 0) {
 		return;
 	}
 	pc->tout = o;
 	pc->last_poll_ns = now_ns;
 	if (o.events & PIMAX_CAM_TRACK_EV_ACQUIRED) {
-		CAM_INFO(pc, "6DoF: tracking (acquisition %" PRIu64 ")", o.acquisitions);
+		CAM_INFO(pc, "6DoF: %s (acquisition %" PRIu64 ")", o.reason, o.acquisitions);
 	}
 	if (o.events & PIMAX_CAM_TRACK_EV_LOST) {
 		CAM_WARN(pc, "6DoF: lost (%s); 3DoF at the last position", o.reason);
@@ -583,11 +652,47 @@ pimax_camera_push_imu(struct pimax_camera *pc, int64_t ts_ns, const struct xrt_v
 	};
 	if (pc->slam_on) {
 		xrt_sink_push_imu(pc->slam_sinks->imus[0], &s);
+		// Same sample into the Rust predictor (rotation at IMU rate between tracker poses).
+		os_mutex_lock(&pc->slam_lock);
+		const double a3[3] = {accel_m_s2->x, accel_m_s2->y, accel_m_s2->z};
+		const double g3[3] = {gyro_rad_s->x, gyro_rad_s->y, gyro_rad_s->z};
+		pimax_cam_track_push_imu(pc->track, ts_ns, a3, g3);
+		os_mutex_unlock(&pc->slam_lock);
 	}
 	if (pc->record_on) {
 		xrt_sink_push_imu(pc->rec_sinks->imus[0], &s);
 	}
 	pc->imu_pushed++;
+}
+
+static void
+rel_to_c(const struct xrt_space_relation *r, pimax_cam_rel *c)
+{
+	memset(c, 0, sizeof(*c));
+	c->pos[0] = r->pose.position.x;
+	c->pos[1] = r->pose.position.y;
+	c->pos[2] = r->pose.position.z;
+	c->q[0] = r->pose.orientation.x;
+	c->q[1] = r->pose.orientation.y;
+	c->q[2] = r->pose.orientation.z;
+	c->q[3] = r->pose.orientation.w;
+	c->lin_vel[0] = r->linear_velocity.x;
+	c->lin_vel[1] = r->linear_velocity.y;
+	c->lin_vel[2] = r->linear_velocity.z;
+	c->ang_vel[0] = r->angular_velocity.x;
+	c->ang_vel[1] = r->angular_velocity.y;
+	c->ang_vel[2] = r->angular_velocity.z;
+	c->flags = (uint32_t)r->relation_flags;
+}
+
+static void
+rel_from_c(const pimax_cam_rel *c, struct xrt_space_relation *r)
+{
+	r->pose.position = (struct xrt_vec3){(float)c->pos[0], (float)c->pos[1], (float)c->pos[2]};
+	r->pose.orientation = (struct xrt_quat){(float)c->q[0], (float)c->q[1], (float)c->q[2], (float)c->q[3]};
+	r->linear_velocity = (struct xrt_vec3){(float)c->lin_vel[0], (float)c->lin_vel[1], (float)c->lin_vel[2]};
+	r->angular_velocity = (struct xrt_vec3){(float)c->ang_vel[0], (float)c->ang_vel[1], (float)c->ang_vel[2]};
+	r->relation_flags = (enum xrt_space_relation_flags)c->flags;
 }
 
 bool
@@ -599,57 +704,23 @@ pimax_camera_head_relation(struct pimax_camera *pc,
 	if (pc == NULL || !pc->slam_on) {
 		return false;
 	}
+	// Rust (pimax_cam_track_head): IMU-rate prediction from the newest tracker pose with blended corrections while
+	// tracking; 3DoF orientation (heading kept continuous) at the held position otherwise.
+	pimax_cam_rel r3, ro;
+	rel_to_c(rel3dof, &r3);
 	os_mutex_lock(&pc->slam_lock);
 	int64_t now = os_monotonic_get_ns();
 	if (now - pc->last_poll_ns > U_TIME_1MS_IN_NS * 4) {
 		slam_poll_locked(pc, now);
 	}
-	pimax_cam_track_out o = pc->tout;
-	struct xrt_space_relation sr = XRT_SPACE_RELATION_ZERO;
-	bool tracked = false;
-	if (o.state == PIMAX_CAM_TRACK_TRACKING) {
-		xrt_tracked_slam_get_tracked_pose(pc->slam, at_ns, &sr);
-		tracked = (sr.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0;
-	}
+	int st = pimax_cam_track_head(pc->track, (uint64_t)now, at_ns, &r3, &ro);
 	os_mutex_unlock(&pc->slam_lock);
-
-	if (tracked) {
-		slam_rel_to_yup(&sr);
-		struct xrt_pose w;
-		quat_d(o.world_from_slam_q, &w.orientation);
-		w.position = (struct xrt_vec3){(float)o.world_from_slam_pos[0], (float)o.world_from_slam_pos[1],
-		                               (float)o.world_from_slam_pos[2]};
-		const struct xrt_pose imu_from_head = {
-		    .orientation = {0.0f, 0.0f, 0.0f, 1.0f},
-		    .position = {(float)pc->head_in_imu[0], (float)pc->head_in_imu[1], (float)pc->head_in_imu[2]}};
-		struct xrt_pose slam_head;
-		math_pose_transform(&sr.pose, &imu_from_head, &slam_head);
-		*out = (struct xrt_space_relation)XRT_SPACE_RELATION_ZERO;
-		math_pose_transform(&w, &slam_head, &out->pose);
-		// Velocity of the head point: v_imu + w x (R * r), then into our world.
-		struct xrt_vec3 r_world, w_x_r;
-		math_quat_rotate_vec3(&sr.pose.orientation, &imu_from_head.position, &r_world);
-		math_vec3_cross(&sr.angular_velocity, &r_world, &w_x_r);
-		struct xrt_vec3 v = {sr.linear_velocity.x + w_x_r.x, sr.linear_velocity.y + w_x_r.y,
-		                     sr.linear_velocity.z + w_x_r.z};
-		math_quat_rotate_vec3(&w.orientation, &v, &out->linear_velocity);
-		math_quat_rotate_vec3(&w.orientation, &sr.angular_velocity, &out->angular_velocity);
-		out->relation_flags = XRT_SPACE_RELATION_BITMASK_ALL;
-		return true;
+	if (st < 0) {
+		return false;
 	}
-
-	// Not tracking: 3DoF orientation (heading kept continuous) at the held position.
 	*out = *rel3dof;
-	struct xrt_quat fix;
-	quat_d(o.fix3dof_q, &fix);
-	math_quat_rotate(&fix, &rel3dof->pose.orientation, &out->pose.orientation);
-	math_quat_rotate_vec3(&fix, &rel3dof->angular_velocity, &out->angular_velocity);
-	out->pose.position =
-	    (struct xrt_vec3){(float)o.held_pos[0], (float)o.held_pos[1], (float)o.held_pos[2]};
-	out->linear_velocity = (struct xrt_vec3){0, 0, 0};
-	if (o.state == PIMAX_CAM_TRACK_LOST) {
-		out->relation_flags |= XRT_SPACE_RELATION_POSITION_VALID_BIT;
-	}
+	rel_from_c(&ro, out);
+	math_quat_normalize(&out->pose.orientation);
 	return true;
 }
 
@@ -902,6 +973,7 @@ capture_thread(void *ptr)
 		}
 		pc->tracking_frames++;
 		pc->win_tracking++;
+		ae_step(pc, now);
 		bool want_slam = pc->slam_on || pc->record_on;
 		bool want_ht = pc->entry[0] != NULL && pc->entry[1] != NULL;
 		if (!want_slam && !want_ht) {
@@ -1013,7 +1085,9 @@ pimax_camera_create(struct xrt_device *hmd,
                     pimax_camera_clock_fn clock,
                     void *clock_user,
                     pimax_camera_orient_fn orient,
-                    void *orient_user)
+                    void *orient_user,
+                    pimax_camera_send_fn send,
+                    void *send_user)
 {
 	const char *hands = debug_get_option_pimax_hands();
 	bool want_hands = hands != NULL && strcmp(hands, "mercury") == 0;
@@ -1023,7 +1097,16 @@ pimax_camera_create(struct xrt_device *hmd,
 	bool want_slam = debug_get_bool_option_pimax_slam();
 	const char *record = debug_get_option_pimax_slam_record();
 	bool want_record = record != NULL && record[0] != '\0' && strcmp(record, "0") != 0;
-	if (!want_hands && !want_slam && !want_record && !debug_get_bool_option_pimax_cam()) {
+	const char *ae = debug_get_option_pimax_cam_ae();
+	enum ae_mode ae_mode = AE_OFF;
+	if (ae != NULL && strcmp(ae, "dry") == 0) {
+		ae_mode = AE_DRY;
+	} else if (ae != NULL && strcmp(ae, "1") == 0) {
+		ae_mode = AE_SEND;
+	} else if (ae != NULL && ae[0] != '\0' && strcmp(ae, "0") != 0) {
+		U_LOG_IFL_W(log_level, "PIMAX_CAM_AE=%s unknown (0, dry or 1); auto-exposure off", ae);
+	}
+	if (!want_hands && !want_slam && !want_record && ae_mode == AE_OFF && !debug_get_bool_option_pimax_cam()) {
 		return NULL;
 	}
 
@@ -1034,6 +1117,8 @@ pimax_camera_create(struct xrt_device *hmd,
 	pc->clock_user = clock_user;
 	pc->orient = orient;
 	pc->orient_user = orient_user;
+	pc->send = send;
+	pc->send_user = send_user;
 	if (os_mutex_init(&pc->slam_lock) == 0) {
 		pc->slam_lock_init = true;
 	}
@@ -1083,6 +1168,25 @@ pimax_camera_create(struct xrt_device *hmd,
 		CAM_WARN(pc, "continuing without 6DoF/recording");
 	}
 
+	if (ae_mode != AE_OFF) {
+		pc->ae = pimax_cam_ae_create();
+		if (pc->ae == NULL) {
+			CAM_ERROR(pc, "auto-exposure: %s", pimax_cam_last_error());
+		} else if (ae_mode == AE_SEND && send == NULL) {
+			CAM_WARN(pc, "PIMAX_CAM_AE=1 but no headset command channel (no device?): dry run only");
+			pc->ae_mode = AE_DRY;
+		} else {
+			pc->ae_mode = ae_mode;
+		}
+		if (pc->ae != NULL) {
+			snprintf(pc->ae_status, sizeof(pc->ae_status), "%s, waiting for tracking frames",
+			         pc->ae_mode == AE_SEND ? "on" : "dry");
+			CAM_WARN(pc, "auto-exposure %s: %s", pc->ae_mode == AE_SEND ? "ON" : "DRY RUN",
+			         pc->ae_mode == AE_SEND ? "sending the exposure push (HID 0x51) to the headset"
+			                                : "computing only, nothing is sent (PIMAX_CAM_AE=1 sends)");
+		}
+	}
+
 	u_var_add_root(pc, "Pimax cameras", true);
 	u_var_add_log_level(pc, &pc->log_level, "log_level");
 	u_var_add_ro_text(pc, pc->source_desc, "source");
@@ -1099,6 +1203,10 @@ pimax_camera_create(struct xrt_device *hmd,
 		pc->recenter_btn.cb = recenter_cb;
 		pc->recenter_btn.ptr = pc;
 		u_var_add_button(pc, &pc->recenter_btn, "Recenter 6DoF (head to origin)");
+	}
+	if (pc->ae != NULL) {
+		u_var_add_gui_header(pc, NULL, "Auto-exposure");
+		u_var_add_ro_text(pc, pc->ae_status, "AE");
 	}
 	for (int t = 0; t < PIMAX_CAM_TILES; t++) {
 		char name[48];
@@ -1156,6 +1264,11 @@ pimax_camera_destroy(struct pimax_camera **pc_ptr)
 		xrt_device_destroy(&pc->ht_dev);
 	}
 	t_stereo_camera_calibration_reference(&pc->stereo, NULL);
+	if (pc->ae != NULL) {
+		CAM_INFO(pc, "AE %s", pc->ae_status);
+		pimax_cam_ae_destroy(pc->ae);
+		pc->ae = NULL;
+	}
 	pimax_cam_track_destroy(pc->track);
 	pc->track = NULL;
 	if (pc->slam_lock_init) {

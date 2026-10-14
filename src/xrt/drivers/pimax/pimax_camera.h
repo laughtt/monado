@@ -37,6 +37,12 @@ typedef bool (*pimax_camera_clock_fn)(void *user, struct pimax_camera_clock_ref 
  */
 typedef bool (*pimax_camera_orient_fn)(void *user, int64_t ts_ns, struct xrt_quat *out);
 
+/*!
+ * Send a host command `58 LL cmd opt data..` to the headset (the HMD owns the libpimax handle). Returns 0 on success.
+ * Used only for the tracking-camera exposure push when PIMAX_CAM_AE=1.
+ */
+typedef int (*pimax_camera_send_fn)(void *user, uint8_t cmd, uint8_t opt, const uint8_t *data, size_t len);
+
 struct pimax_camera;
 
 /*!
@@ -60,9 +66,13 @@ struct pimax_camera;
  *  - PIMAX_SLAM_CAM_OFFSET_US: added to every camera timestamp sent to the tracker/recorder (camera-IMU time offset
  *    test knob, default 0).
  *  - PIMAX_SLAM_IMU=<json>: IMU noise model (default ~/.config/pimax/slam-imu.json, else built-in defaults).
+ *  - PIMAX_SLAM_SMOOTH=0 / PIMAX_SLAM_TAU_MS / PIMAX_SLAM_RESNAP=0: head pose output tuning (pimax_cam.h).
+ *  - PIMAX_CAM_AE: tracking-camera auto-exposure. Unset/0 = off (cameras stay at the power-on 10410/449);
+ *    "dry" = run the controller on the live frames and log what it would send; "1" = also send the exposure
+ *    push (HID 0x51, the frame Windows sends at 12.5 Hz) through @p send. Tuning: PIMAX_CAM_AE_* (pimax_cam.h).
  *
  * @p clock (may be NULL) gives the HMD's IMU clock so frames share the IMU timeline. @p orient (may be NULL)
- * gives the 3DoF orientation history (needed for 6DoF).
+ * gives the 3DoF orientation history (needed for 6DoF). @p send (may be NULL) sends host commands (exposure).
  */
 struct pimax_camera *
 pimax_camera_create(struct xrt_device *hmd,
@@ -70,7 +80,9 @@ pimax_camera_create(struct xrt_device *hmd,
                     pimax_camera_clock_fn clock,
                     void *clock_user,
                     pimax_camera_orient_fn orient,
-                    void *orient_user);
+                    void *orient_user,
+                    pimax_camera_send_fn send,
+                    void *send_user);
 
 /*!
  * True when the camera pipeline wants IMU samples (SLAM tracking or recording active).

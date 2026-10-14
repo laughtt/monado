@@ -196,6 +196,17 @@ pimax_hmd_orient_at(void *user, int64_t ts_ns, struct xrt_quat *out)
 	return true;
 }
 
+//! Camera thread: host command to the headset (exposure push, PIMAX_CAM_AE=1 only).
+static int
+pimax_hmd_send_cmd(void *user, uint8_t cmd, uint8_t opt, const uint8_t *data, size_t len)
+{
+	struct pimax_hmd *hmd = (struct pimax_hmd *)user;
+	if (hmd->lib == NULL) {
+		return -1;
+	}
+	return pimax_send(hmd->lib, cmd, opt, data, len) < 0 ? -1 : 0;
+}
+
 //! Camera thread: the IMU device-clock -> monotonic mapping, so frames share the IMU timeline.
 static bool
 pimax_hmd_clock_ref(void *user, struct pimax_camera_clock_ref *out)
@@ -702,7 +713,7 @@ pimax_hmd_create(struct xrt_device *out_ctrls[2])
 			}
 		}
 		// Cameras still work (live UVC or a PIMAX_CAM_SOURCE replay), timed without the IMU clock.
-		hmd->camera = pimax_camera_create(&hmd->base, hmd->log_level, NULL, NULL, NULL, NULL);
+		hmd->camera = pimax_camera_create(&hmd->base, hmd->log_level, NULL, NULL, NULL, NULL, NULL, NULL);
 		return &hmd->base;
 	}
 
@@ -765,7 +776,8 @@ pimax_hmd_create(struct xrt_device *out_ctrls[2])
 
 	// Tracking cameras and Mercury hands (PIMAX_HANDS=mercury or PIMAX_CAM=1); NULL otherwise.
 	struct pimax_camera *camera =
-	    pimax_camera_create(&hmd->base, hmd->log_level, pimax_hmd_clock_ref, hmd, pimax_hmd_orient_at, hmd);
+	    pimax_camera_create(&hmd->base, hmd->log_level, pimax_hmd_clock_ref, hmd, pimax_hmd_orient_at, hmd,
+	                        pimax_hmd_send_cmd, hmd);
 	os_mutex_lock(&hmd->cam_lock);
 	hmd->camera = camera;
 	os_mutex_unlock(&hmd->cam_lock);
