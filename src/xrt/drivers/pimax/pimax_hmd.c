@@ -19,6 +19,7 @@
 #include "xrt/xrt_device.h"
 
 #include "math/m_relation_history.h"
+#include "math/m_space.h"
 #include "math/m_imu_3dof.h"
 #include "math/m_api.h"
 #include "math/m_vec3.h"
@@ -39,6 +40,7 @@
 #include "pimax_lens.h"
 #include "pimax_ctrl.h"
 #include "pimax_camera.h"
+#include "pimax_eyeglue.h"
 
 #include "os/os_threading.h"
 
@@ -115,6 +117,8 @@ struct pimax_hmd
 	struct pimax_camera_clock_ref clk;
 	//! Tracking cameras + Mercury (NULL unless PIMAX_HANDS / PIMAX_CAM).
 	struct pimax_camera *camera;
+	//! Eye gaze (XR_EXT_eye_gaze_interaction); NULL unless PIMAX_EYE=1.
+	struct pimax_eyeglue *eye;
 };
 
 static inline struct pimax_hmd *
@@ -421,6 +425,9 @@ pimax_hmd_destroy(struct xrt_device *xdev)
 {
 	struct pimax_hmd *hmd = pimax_hmd(xdev);
 
+	// Eye gaze: stops the Rust session (unsubscribe, release the EyeChip) before anything else goes away.
+	pimax_eyeglue_destroy(&hmd->eye);
+
 	// Cameras first: their thread reads the IMU clock snapshot and pushes into Mercury.
 	pimax_camera_destroy(&hmd->camera);
 
@@ -460,7 +467,7 @@ pimax_hmd_get_tracked_pose(struct xrt_device *xdev,
 {
 	struct pimax_hmd *hmd = pimax_hmd(xdev);
 
-	if (name != XRT_INPUT_GENERIC_HEAD_POSE) {
+	if (name != XRT_INPUT_GENERIC_HEAD_POSE && !(name == XRT_INPUT_GENERIC_EYE_GAZE_POSE && hmd->eye != NULL)) {
 		U_LOG_XDEV_UNSUPPORTED_INPUT(&hmd->base, hmd->log_level, name);
 		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
@@ -472,9 +479,57 @@ pimax_hmd_get_tracked_pose(struct xrt_device *xdev,
 		math_quat_normalize(&relation.pose.orientation);
 	}
 
+	if (name == XRT_INPUT_GENERIC_EYE_GAZE_POSE) {
+		// Gaze ray in head space (Rust session), composed with the head pose at the requested time.
+		struct xrt_pose gaze;
+		if (!pimax_eyeglue_get_gaze(hmd->eye, at_timestamp_ns, &gaze)) {
+			*out_relation = (struct xrt_space_relation)XRT_SPACE_RELATION_ZERO;
+			return XRT_SUCCESS;
+		}
+		struct xrt_relation_chain chain = {0};
+		m_relation_chain_push_pose(&chain, &gaze);
+		m_relation_chain_push_relation(&chain, &relation);
+		m_relation_chain_resolve(&chain, out_relation);
+		return XRT_SUCCESS;
+	}
+
 	*out_relation = relation;
 	return XRT_SUCCESS;
 }
+
+static xrt_result_t
+pimax_hmd_begin_feature(struct xrt_device *xdev, enum xrt_device_feature_type type)
+{
+	struct pimax_hmd *hmd = pimax_hmd(xdev);
+	if (type != XRT_DEVICE_FEATURE_EYE_TRACKING || hmd->eye == NULL) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	pimax_eyeglue_begin(hmd->eye);
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+pimax_hmd_end_feature(struct xrt_device *xdev, enum xrt_device_feature_type type)
+{
+	struct pimax_hmd *hmd = pimax_hmd(xdev);
+	if (type != XRT_DEVICE_FEATURE_EYE_TRACKING || hmd->eye == NULL) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	pimax_eyeglue_end(hmd->eye);
+	return XRT_SUCCESS;
+}
+
+static struct xrt_binding_input_pair eye_gaze_inputs_pimax[] = {
+    {XRT_INPUT_GENERIC_EYE_GAZE_POSE, XRT_INPUT_GENERIC_EYE_GAZE_POSE},
+};
+
+static struct xrt_binding_profile pimax_hmd_binding_profiles[] = {
+    {
+        .name = XRT_DEVICE_EYE_GAZE_INTERACTION,
+        .inputs = eye_gaze_inputs_pimax,
+        .input_count = ARRAY_SIZE(eye_gaze_inputs_pimax),
+    },
+};
 
 static xrt_result_t
 pimax_hmd_get_view_poses(struct xrt_device *xdev,
@@ -541,7 +596,9 @@ pimax_hmd_create(struct xrt_device *out_ctrls[2])
 {
 	enum u_device_alloc_flags flags =
 	    (enum u_device_alloc_flags)(U_DEVICE_ALLOC_HMD | U_DEVICE_ALLOC_TRACKING_NONE);
-	struct pimax_hmd *hmd = U_DEVICE_ALLOCATE(struct pimax_hmd, flags, 1, 0);
+	// PIMAX_EYE=1 adds the eye gaze pose as a second input of the HMD (like the PSVR2 driver).
+	const bool want_eye = pimax_eyeglue_enabled();
+	struct pimax_hmd *hmd = U_DEVICE_ALLOCATE(struct pimax_hmd, flags, want_eye ? 2 : 1, 0);
 	if (hmd == NULL) {
 		return NULL;
 	}
@@ -573,6 +630,20 @@ pimax_hmd_create(struct xrt_device *out_ctrls[2])
 	hmd->base.inputs[0].name = XRT_INPUT_GENERIC_HEAD_POSE;
 	hmd->base.supported.orientation_tracking = true;
 	hmd->base.supported.position_tracking = false;
+	if (want_eye) {
+		hmd->eye = pimax_eyeglue_create(hmd->log_level);
+	}
+	if (hmd->eye == NULL) {
+		hmd->base.input_count = 1; // PIMAX_EYE off, or the Rust library does not match this driver
+	} else {
+		hmd->base.inputs[1].name = XRT_INPUT_GENERIC_EYE_GAZE_POSE;
+		hmd->base.supported.eye_gaze = true;
+		hmd->base.begin_feature = pimax_hmd_begin_feature;
+		hmd->base.end_feature = pimax_hmd_end_feature;
+		hmd->base.binding_profiles = pimax_hmd_binding_profiles;
+		hmd->base.binding_profile_count = ARRAY_SIZE(pimax_hmd_binding_profiles);
+		HMD_INFO(hmd, "PIMAX_EYE=1: eye gaze pose exposed (XR_EXT_eye_gaze_interaction)");
+	}
 
 	hmd->base.hmd->blend_modes[0] = XRT_BLEND_MODE_OPAQUE;
 	hmd->base.hmd->blend_mode_count = 1;

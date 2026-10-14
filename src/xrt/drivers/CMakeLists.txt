@@ -132,7 +132,7 @@ if(XRT_BUILD_DRIVER_PIMAX)
 	set(PIMAX_CAM_DIR "$ENV{HOME}/omarchyvr/rust/pimax-cam" CACHE PATH "pimax-cam crate (include/pimax_cam.h)")
 	set(PIMAX_DRIVER_SOURCES
 		pimax/pimax_hmd.c pimax/pimax_lens.c pimax/pimax_lens.h pimax/pimax_interface.h pimax/pimax_prober.c pimax/pimax_ctrl.c pimax/pimax_ctrl.h
-		pimax/pimax_camera.c pimax/pimax_camera.h
+		pimax/pimax_camera.c pimax/pimax_camera.h pimax/pimax_eyeglue.c pimax/pimax_eyeglue.h
 		)
 	if(PIMAX_USE_RUST_LIBPIMAX)
 		add_library(drv_pimax STATIC ${PIMAX_DRIVER_SOURCES})
@@ -141,8 +141,12 @@ if(XRT_BUILD_DRIVER_PIMAX)
 	else()
 		add_library(drv_pimax STATIC ${PIMAX_DRIVER_SOURCES} ${PIMAX_LIBPIMAX_DIR}/src/pimax.c ${PIMAX_LIBPIMAX_DIR}/src/decode.c)
 		target_link_libraries(drv_pimax PRIVATE ${PIMAX_RUST_TARGET_DIR}/libpimax_hands.a ${CMAKE_DL_LIBS} m rt util Threads::Threads)
+		target_compile_definitions(drv_pimax PRIVATE PIMAX_NO_RUST_EYE)
 	endif()
-	target_include_directories(drv_pimax PRIVATE ${PIMAX_LIBPIMAX_DIR}/include ${PIMAX_HANDS_DIR}/include)
+	# Eye gaze (rust/pimax-eye, header include/pimax_eye.h, code in libpimax_capi.a like the hands). PIMAX_EYE=1 at run time.
+	# The C libpimax build has no eye code: pimax_eyeglue.c needs PIMAX_USE_RUST_LIBPIMAX=ON.
+	set(PIMAX_EYE_DIR "$ENV{HOME}/omarchyvr/rust/pimax-eye" CACHE PATH "Path to the pimax-eye crate (include/pimax_eye.h)")
+	target_include_directories(drv_pimax PRIVATE ${PIMAX_LIBPIMAX_DIR}/include ${PIMAX_HANDS_DIR}/include ${PIMAX_EYE_DIR}/include)
 	target_link_libraries(drv_pimax PRIVATE xrt-interfaces aux_util aux_math Threads::Threads)
 	if(PIMAX_CAM)
 		target_compile_definitions(drv_pimax PRIVATE PIMAX_HAVE_CAM)
