@@ -633,7 +633,9 @@ slam_poll_locked(struct pimax_camera *pc, int64_t now_ns)
 		CAM_INFO(pc, "6DoF: recentered");
 	}
 	if (o.events & PIMAX_CAM_TRACK_EV_RESET_WANTED) {
-		CAM_WARN(pc, "6DoF: still lost, resetting the tracker (reset %" PRIu64 ")", o.resets);
+		// Raised after a long loss, or when the tracker drifts while the IMU says the headset lies still
+		// (no landmarks: Basalt integrates the IMU alone; pimax-cam StillParams, PIMAX_SLAM_STILL=0 disables).
+		CAM_WARN(pc, "6DoF: resetting the tracker (%s; reset %" PRIu64 ")", o.reason, o.resets);
 		t_slam_reset(pc->slam);
 	}
 	snprintf(pc->slam_status, sizeof(pc->slam_status), "%s; %" PRIu64 " acquired, %" PRIu64 " lost, %s",
