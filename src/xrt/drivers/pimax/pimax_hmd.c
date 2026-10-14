@@ -41,6 +41,7 @@
 #include "pimax_ctrl.h"
 #include "pimax_camera.h"
 #include "pimax_eyeglue.h"
+#include "pimax_anchor.h"
 
 #include "os/os_threading.h"
 
@@ -528,6 +529,9 @@ pimax_hmd_get_tracked_pose(struct xrt_device *xdev,
 	if (pimax_camera_head_relation(hmd->camera, at_timestamp_ns, &relation, &rel6)) {
 		relation = rel6;
 	}
+
+	// Room anchor (PIMAX_ANCHOR=1): record the raw SLAM pose, then move the world by the offset from `pimax-anchor apply`.
+	pimax_anchor_process(at_timestamp_ns, &relation);
 
 	if (name == XRT_INPUT_GENERIC_EYE_GAZE_POSE) {
 		// Gaze ray in head space (Rust session), composed with the head pose at the requested time.
