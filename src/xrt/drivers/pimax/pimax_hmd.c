@@ -486,8 +486,29 @@ pimax_hmd_get_view_poses(struct xrt_device *xdev,
                          struct xrt_fov *out_fovs,
                          struct xrt_pose *out_poses)
 {
-	return u_device_get_view_poses(xdev, default_eye_relation, at_timestamp_ns, view_type, view_count,
-	                               out_head_relation, out_fovs, out_poses);
+	xrt_result_t xret = u_device_get_view_poses(xdev, default_eye_relation, at_timestamp_ns, view_type, view_count,
+	                                            out_head_relation, out_fovs, out_poses);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+
+	// Display cant (lens.conf cant_deg): the panels point outward, so the left view is yawed to the left (+Y rotation
+	// is counter-clockwise seen from above, -Z is forward), the right view to the right. Positions stay as they are.
+	const struct pimax_hmd *hmd = (const struct pimax_hmd *)xdev;
+	const float cant_rad = DEG_TO_RAD(pimax_lens_get_cant_deg(&hmd->lens));
+	if (cant_rad != 0.0f && view_type == XRT_VIEW_TYPE_STEREO) {
+		const struct xrt_vec3 up = {0.0f, 1.0f, 0.0f};
+		for (uint32_t i = 0; i < view_count && i < 2; i++) {
+			struct xrt_quat yaw;
+			math_quat_from_angle_vector(i == 0 ? cant_rad : -cant_rad, &up, &yaw);
+			// view orientation = existing orientation, then the extra yaw in the view's own frame
+			struct xrt_quat q;
+			math_quat_rotate(&out_poses[i].orientation, &yaw, &q);
+			math_quat_normalize(&q);
+			out_poses[i].orientation = q;
+		}
+	}
+	return XRT_SUCCESS;
 }
 
 static xrt_result_t
