@@ -236,6 +236,10 @@ struct pimax_camera
 	double head_in_imu[3];
 	int64_t last_poll_ns;
 	uint64_t slam_frames, slam_untimed, imu_pushed;
+	//! IMU gate for the tracker (slam_lock): samples handed to it since the last frame set, held samples.
+	uint32_t slam_imu_since_frame;
+	bool slam_imu_frame_seen, slam_imu_holding;
+	uint64_t slam_imu_held, slam_imu_gaps;
 	char slam_status[128];
 	struct u_var_button recenter_btn;
 	int64_t last_info_ns;
@@ -516,9 +520,11 @@ update_stats(struct pimax_camera *pc, int64_t now)
 	         ", IMU-timed %" PRIu64 ", Mercury pairs pushed %" PRIu64 "%s",
 	         pc->fps, pc->tracking_fps, st.frames, st.dropped, st.corrupt, pc->imu_timed, pc->pairs_pushed, "");
 	if (pc->slam_on || pc->record_on) {
-		CAM_INFO(pc, "slam: %" PRIu64 " frame sets, %" PRIu64 " IMU samples, %" PRIu64 " untimed frames skipped%s%s",
-		         pc->slam_frames, pc->imu_pushed, pc->slam_untimed, pc->slam_on ? "; " : "",
-		         pc->slam_on ? pc->slam_status : "");
+		CAM_INFO(pc,
+		         "slam: %" PRIu64 " frame sets, %" PRIu64 " IMU samples (%" PRIu64 " held from the tracker in %" PRIu64
+		         " camera gaps), %" PRIu64 " untimed frames skipped%s%s",
+		         pc->slam_frames, pc->imu_pushed, pc->slam_imu_held, pc->slam_imu_gaps, pc->slam_untimed,
+		         pc->slam_on ? "; " : "", pc->slam_on ? pc->slam_status : "");
 	}
 	if (pc->ae != NULL) {
 		CAM_INFO(pc, "AE %s", pc->ae_status);
@@ -640,6 +646,39 @@ pimax_camera_wants_imu(const struct pimax_camera *pc)
 	return pc != NULL && (pc->slam_on || pc->record_on);
 }
 
+/*!
+ * IMU gate for the SLAM tracker. Basalt (frame_to_frame flow + sqrt VIO) has a blocking IMU queue of 300
+ * samples that its VIO thread drains only when a frame arrives. A camera gap longer than 300 ms at 1 kHz (the
+ * first auto-exposure push re-inits the sensors: ~0.3-0.5 s without frames, as on Windows) fills it; the push
+ * then blocks the libpimax session thread (IMU, keepalive, controllers all stop), and the next frame deadlocks
+ * the tracker: the optical flow waits for an IMU sample newer than the frame, which never comes because the
+ * session thread is stuck on the VIO queue, whose thread waits for the optical flow. The image queue (10) then
+ * fills and blocks the camera thread too. analysis/ae-stall.md in pimax-re.
+ *
+ * So hand the tracker at most SLAM_IMU_FULL samples per frame set at full rate, then every SLAM_IMU_DECIM-th
+ * sample (a coarse IMU across the gap) up to SLAM_IMU_SPARSE more, then nothing until the next frame set.
+ * Nothing before the first frame set either (the tracker does not need it). The predictor and the recorder
+ * still get every sample.
+ */
+#define SLAM_IMU_FULL 200u
+#define SLAM_IMU_DECIM 10u
+#define SLAM_IMU_SPARSE 60u
+
+//! Caller holds slam_lock. True = hand this sample to the tracker.
+static bool
+slam_imu_gate_locked(struct pimax_camera *pc)
+{
+	if (!pc->slam_imu_frame_seen) {
+		return false;
+	}
+	uint32_t n = pc->slam_imu_since_frame++;
+	if (n < SLAM_IMU_FULL) {
+		return true;
+	}
+	n -= SLAM_IMU_FULL;
+	return n < SLAM_IMU_SPARSE * SLAM_IMU_DECIM && n % SLAM_IMU_DECIM == 0;
+}
+
 void
 pimax_camera_push_imu(struct pimax_camera *pc, int64_t ts_ns, const struct xrt_vec3 *accel_m_s2,
                       const struct xrt_vec3 *gyro_rad_s)
@@ -653,13 +692,32 @@ pimax_camera_push_imu(struct pimax_camera *pc, int64_t ts_ns, const struct xrt_v
 	    .gyro_rad_secs = {gyro_rad_s->x, gyro_rad_s->y, gyro_rad_s->z},
 	};
 	if (pc->slam_on) {
-		xrt_sink_push_imu(pc->slam_sinks->imus[0], &s);
 		// Same sample into the Rust predictor (rotation at IMU rate between tracker poses).
 		os_mutex_lock(&pc->slam_lock);
 		const double a3[3] = {accel_m_s2->x, accel_m_s2->y, accel_m_s2->z};
 		const double g3[3] = {gyro_rad_s->x, gyro_rad_s->y, gyro_rad_s->z};
 		pimax_cam_track_push_imu(pc->track, ts_ns, a3, g3);
+		bool feed = slam_imu_gate_locked(pc);
+		bool started = !feed && !pc->slam_imu_holding && pc->slam_imu_frame_seen;
+		if (!feed) {
+			pc->slam_imu_held++;
+			if (started) {
+				pc->slam_imu_gaps++;
+			}
+		}
+		pc->slam_imu_holding = !feed && pc->slam_imu_frame_seen;
+		uint64_t gaps = pc->slam_imu_gaps;
 		os_mutex_unlock(&pc->slam_lock);
+		if (started && (gaps <= 3 || gaps % 100 == 0)) {
+			CAM_WARN(pc,
+			         "camera gap: holding IMU back from the tracker until the next frame set (gap %" PRIu64
+			         "; Basalt's 300-sample IMU queue would otherwise block the HID thread)",
+			         gaps);
+		}
+		// Basalt's push blocks when its queue is full; the gate keeps it below capacity (slam_imu_gate_locked).
+		if (feed) {
+			xrt_sink_push_imu(pc->slam_sinks->imus[0], &s);
+		}
 	}
 	if (pc->record_on) {
 		xrt_sink_push_imu(pc->rec_sinks->imus[0], &s);
@@ -770,6 +828,8 @@ push_slam_frames(struct pimax_camera *pc, struct xrt_frame *tiles[PIMAX_CAM_TILE
 	pc->slam_frames++;
 	if (pc->slam_on) {
 		os_mutex_lock(&pc->slam_lock);
+		pc->slam_imu_frame_seen = true;
+		pc->slam_imu_since_frame = 0;
 		slam_poll_locked(pc, os_monotonic_get_ns());
 		os_mutex_unlock(&pc->slam_lock);
 	}
