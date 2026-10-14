@@ -1415,6 +1415,34 @@ t_slam_start(struct xrt_tracked_slam *xts)
 	return 0;
 }
 
+extern "C" bool
+t_slam_get_latest_pose(struct xrt_tracked_slam *xts, int64_t *out_ts_ns, struct xrt_space_relation *out_relation)
+{
+	auto &t = *container_of(xts, TrackerSlam, base);
+	flush_poses(t);
+	int64_t ts = 0;
+	xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
+	if (!t.slam_rels.get_latest(&ts, &rel)) {
+		return false;
+	}
+	*out_ts_ns = ts;
+	*out_relation = rel;
+	return true;
+}
+
+extern "C" int
+t_slam_reset(struct xrt_tracked_slam *xts)
+{
+	auto &t = *container_of(xts, TrackerSlam, base);
+	vit_result_t vres = t.vit.tracker_reset(t.tracker);
+	if (vres != VIT_SUCCESS) {
+		SLAM_WARN("Failed to reset VIT tracker (%d)", vres);
+		return -1;
+	}
+	SLAM_INFO("VIT tracker reset");
+	return 0;
+}
+
 extern "C" void
 t_slam_fill_default_config(struct t_slam_tracker_config *config)
 {
