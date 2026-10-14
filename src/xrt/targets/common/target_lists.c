@@ -271,6 +271,11 @@ xrt_auto_prober_create_func_t target_auto_list[] = {
     euroc_create_auto_prober,
 #endif
 
+#ifdef XRT_BUILD_DRIVER_PIMAX
+    // Test aid, only with PIMAX_NO_DEVICE=1 and no headset on USB; before the simulated HMD.
+    pimax_create_auto_prober,
+#endif
+
 #ifdef XRT_BUILD_DRIVER_SIMULATED
     // Simulated headset driver last.
     simulated_create_auto_prober,

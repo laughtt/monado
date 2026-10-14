@@ -5,9 +5,13 @@
  * @brief  Pimax Dream Air controllers. See analysis/monado-controllers.md.
  *
  * Two xrt_devices (left slot 2, right slot 3) exposed with the Oculus Touch profile. No optical tracking:
- * PIMAX_CTRL_POSE=fixed (default): fixed offset from the head, following head yaw only, forward orientation.
+ * PIMAX_CTRL_POSE=fixed (default): synthesized poses from rust/pimax-hands (rest.rs): a fixed place in the head-yaw
+ * frame, in the lower part of the view (PIMAX_CTRL_REST=desk|legacy|side,down,fwd[,grip_pitch_deg]), aim level or
+ * aimed where the head looks (PIMAX_CTRL_AIM=level|head[:m]), grip pitched like a held handle (analysis/hands-desk.md).
  * PIMAX_CTRL_POSE=imu: same position, orientation from the controller IMU (accel 1024 LSB/g, gyro scale is a guess,
  * PIMAX_CTRL_GYRO_LSB_DPS, default 16.4, axes assumed == OpenXR axes).
+ * Also offered as /interaction_profiles/ext/hand_interaction_ext (pinch = trigger, grasp = squeeze) for apps that
+ * only suggest hand-interaction bindings; apps with Touch bindings keep the Touch profile.
  *
  * Hand tracking (XR_EXT_hand_tracking, data source CONTROLLER): the finger curls come from the Rust crate pimax-hands
  * (trigger -> index, grip -> middle/ring/little, touch bits -> thumb; filters + thumb state machine live there), this
@@ -57,11 +61,6 @@ DEBUG_GET_ONCE_BOOL_OPTION(pimax_ctrl_hands, "PIMAX_CTRL_HANDS", true)
 DEBUG_GET_ONCE_BOOL_OPTION(pimax_ctrl_hands_demo, "PIMAX_CTRL_HANDS_DEMO", false)
 DEBUG_GET_ONCE_OPTION(pimax_ctrl_hands_feed, "PIMAX_CTRL_HANDS_FEED", "lazy")
 
-// Fixed offsets in the head-yaw frame (x right, y up, -z forward).
-#define OFF_SIDE 0.20f
-#define OFF_DOWN 0.30f
-#define OFF_FWD 0.35f
-
 #define ACTIVE_TIMEOUT_NS (1500ull * 1000 * 1000) // no report for this long -> inputs inactive
 #define REATTACH_MIN_NS (2500ull * 1000 * 1000)
 #define BIAS_SAMPLES 250 // ~1 s at 250 Hz
@@ -96,6 +95,7 @@ struct pimax_ctrl_ctx
 	bool hands;       // controller-driven hand tracking (pimax-hands)
 	bool hands_demo;  // scripted input instead of reports (PIMAX_CTRL_HANDS_DEMO)
 	bool hands_eager; // PIMAX_CTRL_HANDS_FEED=report: feed Rust on the session thread (old behaviour)
+	struct xrt_pose aim_to_grip; // fixed grip pitch relative to the aim (IMU mode), from pimax-hands
 
 	struct pimax_controller *ctl[2]; // [0] left (slot 2), [1] right (slot 3)
 
@@ -205,7 +205,26 @@ static struct xrt_binding_output_pair index_outputs[1] = {
     {XRT_OUTPUT_NAME_INDEX_HAPTIC, XRT_OUTPUT_NAME_TOUCH_HAPTIC},
 };
 
-static struct xrt_binding_profile profiles_left[2] = {
+// XR_EXT_hand_interaction for hand-only apps: pinch / aim activate = trigger (ready = finger on the trigger),
+// grasp = squeeze. Monado only offers the profile when a device maps it; the Touch profile still wins when suggested.
+static struct xrt_binding_input_pair hand_interaction_inputs[8] = {
+    {XRT_INPUT_HAND_PINCH_VALUE, XRT_INPUT_TOUCH_TRIGGER_VALUE},
+    {XRT_INPUT_HAND_PINCH_READY, XRT_INPUT_TOUCH_TRIGGER_TOUCH},
+    {XRT_INPUT_HAND_AIM_ACTIVATE_VALUE, XRT_INPUT_TOUCH_TRIGGER_VALUE},
+    {XRT_INPUT_HAND_AIM_ACTIVATE_READY, XRT_INPUT_TOUCH_TRIGGER_TOUCH},
+    {XRT_INPUT_HAND_GRASP_VALUE, XRT_INPUT_TOUCH_SQUEEZE_VALUE},
+    {XRT_INPUT_HAND_GRASP_READY, XRT_INPUT_TOUCH_SQUEEZE_VALUE},
+    {XRT_INPUT_HAND_AIM_POSE, XRT_INPUT_TOUCH_AIM_POSE},
+    {XRT_INPUT_HAND_GRIP_POSE, XRT_INPUT_TOUCH_GRIP_POSE},
+};
+
+#define HAND_INTERACTION_PROFILE                                                                                       \
+	{                                                                                                              \
+		.name = XRT_DEVICE_EXT_HAND_INTERACTION, .inputs = hand_interaction_inputs,                            \
+		.input_count = ARRAY_SIZE(hand_interaction_inputs), .outputs = NULL, .output_count = 0,                \
+	}
+
+static struct xrt_binding_profile profiles_left[3] = {
     {.name = XRT_DEVICE_SIMPLE_CONTROLLER,
      .inputs = simple_inputs_left,
      .input_count = ARRAY_SIZE(simple_inputs_left),
@@ -216,8 +235,9 @@ static struct xrt_binding_profile profiles_left[2] = {
      .input_count = ARRAY_SIZE(index_inputs_left),
      .outputs = index_outputs,
      .output_count = ARRAY_SIZE(index_outputs)},
+    HAND_INTERACTION_PROFILE,
 };
-static struct xrt_binding_profile profiles_right[2] = {
+static struct xrt_binding_profile profiles_right[3] = {
     {.name = XRT_DEVICE_SIMPLE_CONTROLLER,
      .inputs = simple_inputs_right,
      .input_count = ARRAY_SIZE(simple_inputs_right),
@@ -228,6 +248,7 @@ static struct xrt_binding_profile profiles_right[2] = {
      .input_count = ARRAY_SIZE(index_inputs_right),
      .outputs = index_outputs,
      .output_count = ARRAY_SIZE(index_outputs)},
+    HAND_INTERACTION_PROFILE,
 };
 
 /*
@@ -278,6 +299,16 @@ pimax_ctl_update_inputs(struct xrt_device *xdev)
 	pthread_mutex_lock(&c->lock);
 	bool active = c->have_report && (now - c->last_report_ns) < ACTIVE_TIMEOUT_NS;
 	uint64_t ts = c->have_report ? (int64_t)c->last_report_ns : (int64_t)now;
+	if (c->ctx->hands_demo) {
+		// Test aid: the scripted demo input (the one that drives the fingers) also drives trigger and squeeze, so
+		// pinch / click paths can be tested end to end without a human (or a headset, with PIMAX_NO_DEVICE=1).
+		pimax_hands_input d;
+		pimax_hands_demo_input(now, !left, &d);
+		c->trigger = d.trigger;
+		c->grip = d.grip;
+		active = true;
+		ts = now;
+	}
 	struct xrt_input *in = c->base.inputs;
 	in[I_BTN1_CLICK].value.boolean = c->btn_a;
 	in[I_BTN1_TOUCH].value.boolean = c->t_a || c->btn_a;
@@ -326,6 +357,17 @@ head_yaw(struct pimax_controller *c, int64_t at_ns)
 	return q;
 }
 
+static struct xrt_pose
+pose_from_rust(const pimax_hands_pose *p)
+{
+	struct xrt_pose out = {
+	    .orientation = {p->orientation[0], p->orientation[1], p->orientation[2], p->orientation[3]},
+	    .position = {p->position[0], p->position[1], p->position[2]},
+	};
+	math_quat_normalize(&out.orientation);
+	return out;
+}
+
 static xrt_result_t
 pimax_ctl_get_tracked_pose(struct xrt_device *xdev,
                            enum xrt_input_name name,
@@ -338,24 +380,40 @@ pimax_ctl_get_tracked_pose(struct xrt_device *xdev,
 		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
 
-	struct xrt_quat yaw = head_yaw(c, at_timestamp_ns);
-	struct xrt_vec3 off = {c->index == 0 ? -OFF_SIDE : OFF_SIDE, -OFF_DOWN, -OFF_FWD};
-	struct xrt_vec3 pos;
-	math_quat_rotate_vec3(&yaw, &off, &pos);
+	// Synthesized placement (rust/pimax-hands rest.rs) from the head orientation at that time.
+	float head_q[4] = {0, 0, 0, 1};
+	struct xrt_space_relation head = XRT_SPACE_RELATION_ZERO;
+	if (c->ctx->head != NULL &&
+	    xrt_device_get_tracked_pose(c->ctx->head, XRT_INPUT_GENERIC_HEAD_POSE, at_timestamp_ns, &head) == XRT_SUCCESS &&
+	    (head.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) != 0) {
+		head_q[0] = head.pose.orientation.x;
+		head_q[1] = head.pose.orientation.y;
+		head_q[2] = head.pose.orientation.z;
+		head_q[3] = head.pose.orientation.w;
+	}
+	pimax_hands_pose aim, grip;
+	pimax_hands_controller_poses(c->index == 1, head_q, &aim, &grip);
+	struct xrt_pose pose = pose_from_rust(name == XRT_INPUT_TOUCH_AIM_POSE ? &aim : &grip);
 
-	struct xrt_quat orient = yaw;
 	if (c->ctx->imu_mode) {
 		pthread_mutex_lock(&c->lock);
 		if (c->bias_done) {
+			// Orientation from the controller IMU (aim); the grip keeps its fixed pitch relative to the aim.
+			struct xrt_quat orient;
 			math_quat_rotate(&c->yaw_ref, &c->imu_rot, &orient);
 			math_quat_normalize(&orient);
+			if (name == XRT_INPUT_TOUCH_GRIP_POSE) {
+				struct xrt_quat a2g = c->ctx->aim_to_grip.orientation;
+				math_quat_rotate(&orient, &a2g, &orient);
+				math_quat_normalize(&orient);
+			}
+			pose.orientation = orient;
 		}
 		pthread_mutex_unlock(&c->lock);
 	}
 
 	struct xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
-	rel.pose.orientation = orient;
-	rel.pose.position = pos;
+	rel.pose = pose;
 	// Position is a fixed guess, not tracked: valid but not "tracked".
 	rel.relation_flags = (enum xrt_space_relation_flags)(XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
 	                                                     XRT_SPACE_RELATION_POSITION_VALID_BIT |
@@ -738,7 +796,7 @@ ctl_create(struct pimax_ctrl_ctx *ctx, int index)
 	snprintf(c->base.str, XRT_DEVICE_NAME_LEN, "Pimax Dream Air %s Controller", left ? "Left" : "Right");
 	snprintf(c->base.serial, XRT_DEVICE_NAME_LEN, "pimax-ctrl-%s", left ? "left" : "right");
 	c->base.binding_profiles = left ? profiles_left : profiles_right;
-	c->base.binding_profile_count = 2;
+	c->base.binding_profile_count = ARRAY_SIZE(profiles_left);
 	c->base.supported.orientation_tracking = ctx->imu_mode;
 	c->base.supported.position_tracking = false;
 	c->base.supported.battery_status = true;
@@ -809,6 +867,15 @@ pimax_ctrl_create(struct xrt_device *head, enum u_logging_level log_level, struc
 	ctx->hands_demo = ctx->hands && debug_get_bool_option_pimax_ctrl_hands_demo();
 	const char *feed = debug_get_option_pimax_ctrl_hands_feed();
 	ctx->hands_eager = ctx->hands && feed != NULL && strcmp(feed, "report") == 0;
+	pimax_hands_pose a2g;
+	pimax_hands_aim_to_grip(&a2g);
+	ctx->aim_to_grip = pose_from_rust(&a2g);
+	char placement[256];
+	if (pimax_hands_controller_describe(placement, sizeof(placement)) != 0) {
+		U_LOG_IFL_W(log_level, "Pimax controllers: %s", placement);
+	} else {
+		U_LOG_IFL_I(log_level, "Pimax controllers: %s", placement);
+	}
 	if (ctx->hands && pimax_hands_abi_version() != PIMAX_HANDS_ABI_VERSION) {
 		U_LOG_IFL_E(log_level, "pimax-hands ABI %u != header %u: stale libpimax_capi.a, hand tracking off",
 		            pimax_hands_abi_version(), PIMAX_HANDS_ABI_VERSION);

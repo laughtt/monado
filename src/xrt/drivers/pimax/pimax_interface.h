@@ -39,6 +39,10 @@ pimax_found(struct xrt_prober *xp,
             cJSON *attached_data,
             struct xrt_device **out_xdev);
 
+/*! Auto prober (test aid): creates the HMD without a headset on USB when PIMAX_NO_DEVICE=1, otherwise nothing. */
+struct xrt_auto_prober *
+pimax_create_auto_prober(void);
+
 /*! Create the HMD (opens libpimax session). out_ctrls[2] receives left/right controllers (NULL if none). */
 struct xrt_device *
 pimax_hmd_create(struct xrt_device *out_ctrls[2]);
