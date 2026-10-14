@@ -66,6 +66,8 @@ struct pimax_camera;
  *  - PIMAX_SLAM_CAM_OFFSET_US: added to every camera timestamp sent to the tracker/recorder (camera-IMU time offset
  *    test knob, default 0).
  *  - PIMAX_SLAM_IMU=<json>: IMU noise model (default ~/.config/pimax/slam-imu.json, else built-in defaults).
+ *  - PIMAX_SLAM_EXPOSURE_MID (default 1): tracker/recorder frame time = metadata stamp + exposure/2 (the stamp
+ *    marks the exposure start; 5.2 ms at the power-on exposure 10410 us). 0 = raw stamp (phase-1 recordings).
  *  - PIMAX_SLAM_SMOOTH=0 / PIMAX_SLAM_TAU_MS / PIMAX_SLAM_RESNAP=0: head pose output tuning (pimax_cam.h).
  *  - PIMAX_CAM_AE: tracking-camera auto-exposure. Unset/0 = off (cameras stay at the power-on 10410/449);
  *    "dry" = run the controller on the live frames and log what it would send; "1" = also send the exposure

@@ -154,6 +154,7 @@ DEBUG_GET_ONCE_OPTION(pimax_slam_record, "PIMAX_SLAM_RECORD", NULL)
 DEBUG_GET_ONCE_NUM_OPTION(pimax_slam_cam_offset_us, "PIMAX_SLAM_CAM_OFFSET_US", 0)
 DEBUG_GET_ONCE_OPTION(pimax_slam_imu, "PIMAX_SLAM_IMU", NULL)
 DEBUG_GET_ONCE_OPTION(pimax_cam_ae, "PIMAX_CAM_AE", NULL)
+DEBUG_GET_ONCE_BOOL_OPTION(pimax_slam_exposure_mid, "PIMAX_SLAM_EXPOSURE_MID", true)
 
 enum ae_mode
 {
@@ -222,6 +223,7 @@ struct pimax_camera
 	uint32_t slam_cams[4]; //!< factory camera ids in tracker order
 	uint32_t slam_n;
 	int64_t slam_cam_offset_ns;
+	bool exposure_mid; //!< tracker frame time = stamp + exposure/2 (the stamp marks the exposure start)
 	struct t_slam_calibration slam_calib;
 	struct xrt_tracked_slam *slam;
 	struct xrt_slam_sinks *slam_sinks;
@@ -735,10 +737,14 @@ recenter_cb(void *ptr)
 	}
 }
 
-//! Push one IMU-timed tracking frame (tiles in tracker order) to the tracker and/or the recorder.
+//! Push one IMU-timed tracking frame (tiles in tracker order) to the tracker and/or the recorder. @p exp_us =
+//! exposure of the first tracker camera (one timestamp per frame set: Basalt wants them identical).
 static void
-push_slam_frames(struct pimax_camera *pc, struct xrt_frame *tiles[PIMAX_CAM_TILES], int64_t ts)
+push_slam_frames(struct pimax_camera *pc, struct xrt_frame *tiles[PIMAX_CAM_TILES], int64_t ts, uint32_t exp_us)
 {
+	// Mid-exposure time: the frame stamp marks the exposure start (image rows start exposure/38.8 us later and
+	// Pimax's factory delta 1.638 ms = half its typical 3.3 ms exposure; analysis/slam-exposure.md).
+	int64_t adj = pc->slam_cam_offset_ns + (pc->exposure_mid ? (int64_t)exp_us * 500 : 0);
 	for (uint32_t i = 0; i < pc->slam_n; i++) {
 		if (tiles[pc->slam_cams[i]] == NULL) {
 			return; // all or nothing: the tracker wants one frame per camera per timestamp
@@ -748,9 +754,9 @@ push_slam_frames(struct pimax_camera *pc, struct xrt_frame *tiles[PIMAX_CAM_TILE
 		// Shared frames: set the tracker timestamp on a private copy only when an offset is configured.
 		struct xrt_frame *xf = tiles[pc->slam_cams[i]];
 		struct xrt_frame *own = NULL;
-		if (pc->slam_cam_offset_ns != 0) {
+		if (adj != 0) {
 			u_frame_clone(xf, &own);
-			own->timestamp = ts + pc->slam_cam_offset_ns;
+			own->timestamp = ts + adj;
 			xf = own;
 		}
 		if (pc->slam_on) {
@@ -837,6 +843,7 @@ setup_slam(struct pimax_camera *pc, bool want_slam, const char *record)
 		}
 	}
 	pc->slam_cam_offset_ns = (int64_t)debug_get_num_option_pimax_slam_cam_offset_us() * 1000;
+	pc->exposure_mid = debug_get_bool_option_pimax_slam_exposure_mid();
 
 	pimax_cam_slam_imu imu;
 	int ir = pimax_cam_slam_imu_load(debug_get_option_pimax_slam_imu(), &imu);
@@ -862,8 +869,10 @@ setup_slam(struct pimax_camera *pc, bool want_slam, const char *record)
 		snprintf(names + l, sizeof(names) - l, "%s%u (%s)", i ? ", " : "", pc->slam_cams[i],
 		         pc->calib.cameras[pc->slam_cams[i]].name);
 	}
-	CAM_INFO(pc, "SLAM sensors: cameras %s at 25 Hz, IMU 1 kHz, noise from %s, camera offset %" PRId64 " us", names,
-	         imu.source, pc->slam_cam_offset_ns / 1000);
+	CAM_INFO(pc,
+	         "SLAM sensors: cameras %s at 25 Hz, IMU 1 kHz, noise from %s, camera offset %" PRId64
+	         " us, frame time at mid-exposure %s",
+	         names, imu.source, pc->slam_cam_offset_ns / 1000, pc->exposure_mid ? "on" : "off");
 
 	if (record != NULL && record[0] != '\0' && strcmp(record, "0") != 0) {
 		if (strcmp(record, "1") == 0) {
@@ -872,8 +881,10 @@ setup_slam(struct pimax_camera *pc, bool want_slam, const char *record)
 			snprintf(pc->rec_path, sizeof(pc->rec_path), "%s", record);
 		}
 		char note[256];
-		snprintf(note, sizeof(note), "Monado pimax driver EuRoC recording; camera offset %" PRId64 " us applied",
-		         pc->slam_cam_offset_ns / 1000);
+		snprintf(note, sizeof(note),
+		         "Monado pimax driver EuRoC recording; camera offset %" PRId64
+		         " us applied; frame time = stamp + exposure/2: %s",
+		         pc->slam_cam_offset_ns / 1000, pc->exposure_mid ? "yes" : "no");
 		if (pimax_cam_slam_write_basalt(&pc->calib, pc->slam_cams, pc->slam_n, 25.0, 0, &imu, pc->rec_path,
 		                                note) != 0) {
 			CAM_ERROR(pc, "recording directory %s: %s", pc->rec_path, pimax_cam_last_error());
@@ -1004,7 +1015,7 @@ capture_thread(void *ptr)
 			pc->pairs_pushed++;
 		}
 		if (want_slam && imu_timed) {
-			push_slam_frames(pc, tiles, (int64_t)ts);
+			push_slam_frames(pc, tiles, (int64_t)ts, fi.exposure[pc->slam_cams[0]]);
 		}
 		for (uint32_t t = 0; t < PIMAX_CAM_TILES; t++) {
 			xrt_frame_reference(&tiles[t], NULL);
