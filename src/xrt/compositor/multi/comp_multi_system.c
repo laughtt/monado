@@ -523,6 +523,52 @@ update_session_state_locked(struct multi_system_compositor *msc)
 	}
 }
 
+/*!
+ * PIMAX_PERF_FILE: every 0.5 s write a small key=value text file (atomic rename) with the compositor and per-session
+ * frame statistics for the pimax-perf wrist readout. Late/skipped are cumulative; fps values are over the last window.
+ */
+static void
+perf_report(struct multi_system_compositor *msc, int64_t now_ns, int64_t period_ns)
+{
+	if (msc->perf.path[0] == 0 || now_ns - msc->perf.last_write_ns < 500 * U_TIME_1MS_IN_NS) {
+		return;
+	}
+	double dt = (double)(now_ns - msc->perf.last_write_ns) / 1e9;
+	if (msc->perf.last_write_ns == 0) {
+		msc->perf.last_write_ns = now_ns;
+		msc->perf.frames_prev = msc->perf.frames;
+		return;
+	}
+	char tmp[600];
+	snprintf(tmp, sizeof(tmp), "%s.tmp", msc->perf.path);
+	FILE *f = fopen(tmp, "w");
+	if (f == NULL) {
+		msc->perf.last_write_ns = now_ns;
+		return;
+	}
+	fprintf(f, "v=1\nt_ms=%lld\nperiod_ms=%.3f\ncomp_fps=%.1f\ncomp_frames=%llu\ncomp_late=%llu\ncomp_skipped=%llu\n",
+	        (long long)(now_ns / 1000000), (double)period_ns / 1e6,
+	        (double)(msc->perf.frames - msc->perf.frames_prev) / dt, (unsigned long long)msc->perf.frames,
+	        (unsigned long long)msc->perf.late, (unsigned long long)msc->perf.skipped);
+	os_mutex_lock(&msc->list_and_timing_lock);
+	for (size_t k = 0; k < ARRAY_SIZE(msc->clients); k++) {
+		struct multi_compositor *mc = msc->clients[k];
+		if (mc == NULL) {
+			continue;
+		}
+		fprintf(f, "app overlay=%d active=%d fps=%.1f frames=%llu cpu_ms=%.2f gpu_ms=%.2f\n",
+		        mc->xsi.is_overlay ? 1 : 0, mc->state.session_active ? 1 : 0,
+		        (double)(mc->perf.frames - mc->perf.frames_prev) / dt, (unsigned long long)mc->perf.frames,
+		        mc->perf.cpu_ms, mc->perf.gpu_ms);
+		mc->perf.frames_prev = mc->perf.frames;
+	}
+	os_mutex_unlock(&msc->list_and_timing_lock);
+	fclose(f);
+	rename(tmp, msc->perf.path);
+	msc->perf.frames_prev = msc->perf.frames;
+	msc->perf.last_write_ns = now_ns;
+}
+
 static int
 multi_main_loop(struct multi_system_compositor *msc)
 {
@@ -592,6 +638,20 @@ multi_main_loop(struct multi_system_compositor *msc)
 		os_mutex_unlock(&msc->list_and_timing_lock);
 
 		xrt_comp_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
+
+		if (msc->perf.path[0] != 0) {
+			int64_t done_ns = os_monotonic_get_ns();
+			msc->perf.frames++;
+			if (done_ns > predicted_display_time_ns) {
+				msc->perf.late++;
+			}
+			if (msc->perf.last_display_ns != 0 && predicted_display_period_ns > 0 &&
+			    predicted_display_time_ns - msc->perf.last_display_ns > predicted_display_period_ns * 3 / 2) {
+				msc->perf.skipped++;
+			}
+			msc->perf.last_display_ns = predicted_display_time_ns;
+			perf_report(msc, done_ns, predicted_display_period_ns);
+		}
 
 		// Re-lock the thread for check in while statement.
 		os_thread_helper_lock(&msc->oth);
@@ -874,6 +934,11 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
 	msc->get_view_config_callback = get_view_config_callback;
 
 	os_mutex_init(&msc->list_and_timing_lock);
+
+	const char *perf_path = getenv("PIMAX_PERF_FILE");
+	if (perf_path != NULL && perf_path[0] != 0 && strlen(perf_path) < sizeof(msc->perf.path) - 8) {
+		strcpy(msc->perf.path, perf_path);
+	}
 
 	//! @todo Make the clients not go from IDLE to READY before we have completed a first frame.
 	// Make sure there is at least some sort of valid frame data here.

@@ -304,6 +304,10 @@ run_func(void *ptr)
 
 		os_mutex_lock(&mc->msc->list_and_timing_lock);
 		u_pa_mark_gpu_done(mc->upa, frame_id, now_ns);
+		if (mc->perf.delivered_ns > 0 && now_ns >= mc->perf.delivered_ns) {
+			double ms = (double)(now_ns - mc->perf.delivered_ns) / 1e6;
+			mc->perf.gpu_ms = mc->perf.gpu_ms == 0.0 ? ms : mc->perf.gpu_ms * 0.9 + ms * 0.1;
+		}
 		os_mutex_unlock(&mc->msc->list_and_timing_lock);
 
 		// Wait for the delivery slot.
@@ -601,6 +605,7 @@ multi_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 	os_mutex_lock(&mc->msc->list_and_timing_lock);
 	int64_t now_ns = os_monotonic_get_ns();
 	u_pa_mark_point(mc->upa, frame_id, U_TIMING_POINT_BEGIN, now_ns);
+	mc->perf.begin_ns = now_ns;
 	os_mutex_unlock(&mc->msc->list_and_timing_lock);
 
 	return XRT_SUCCESS;
@@ -632,6 +637,12 @@ multi_compositor_layer_begin(struct xrt_compositor *xc, const struct xrt_layer_f
 	int64_t now_ns = os_monotonic_get_ns();
 	os_mutex_lock(&mc->msc->list_and_timing_lock);
 	u_pa_mark_delivered(mc->upa, data->frame_id, now_ns, data->display_time_ns);
+	if (mc->perf.begin_ns > 0 && now_ns >= mc->perf.begin_ns) {
+		double ms = (double)(now_ns - mc->perf.begin_ns) / 1e6;
+		mc->perf.cpu_ms = mc->perf.frames == 0 ? ms : mc->perf.cpu_ms * 0.9 + ms * 0.1;
+	}
+	mc->perf.delivered_ns = now_ns;
+	mc->perf.frames++;
 	os_mutex_unlock(&mc->msc->list_and_timing_lock);
 
 	/*
@@ -813,6 +824,10 @@ multi_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 		os_mutex_lock(&mc->msc->list_and_timing_lock);
 		u_pa_mark_gpu_done(mc->upa, frame_id, now_ns);
+		if (mc->perf.delivered_ns > 0 && now_ns >= mc->perf.delivered_ns) {
+			double ms = (double)(now_ns - mc->perf.delivered_ns) / 1e6;
+			mc->perf.gpu_ms = mc->perf.gpu_ms == 0.0 ? ms : mc->perf.gpu_ms * 0.9 + ms * 0.1;
+		}
 		os_mutex_unlock(&mc->msc->list_and_timing_lock);
 
 		wait_for_scheduled_free(mc);

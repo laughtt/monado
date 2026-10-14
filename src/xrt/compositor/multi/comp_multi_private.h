@@ -191,6 +191,17 @@ struct multi_compositor
 	struct u_pacing_app *upa;
 
 	float current_refresh_rate_hz;
+
+	//! Frame statistics for PIMAX_PERF_FILE, all under list_and_timing_lock (see comp_multi_system.c).
+	struct
+	{
+		int64_t begin_ns;     //!< xrBeginFrame of the frame in flight
+		int64_t delivered_ns; //!< its xrEndFrame
+		uint64_t frames;      //!< frames delivered (cumulative)
+		uint64_t frames_prev; //!< value at the last report
+		double cpu_ms;        //!< smoothed begin -> end
+		double gpu_ms;        //!< smoothed end -> GPU done
+	} perf;
 };
 
 /*!
@@ -378,6 +389,18 @@ struct multi_system_compositor
 
 	//! Chroma key parameters in HSV space
 	struct xrt_layer_chroma_key_data chroma_key;
+
+	//! Stats file (PIMAX_PERF_FILE), main loop thread only.
+	struct
+	{
+		char path[512];       //!< empty = off
+		int64_t last_write_ns;
+		int64_t last_display_ns;
+		uint64_t frames;      //!< compositor frames (cumulative)
+		uint64_t frames_prev;
+		uint64_t late;        //!< committed after the predicted display time
+		uint64_t skipped;     //!< frames the pacer skipped (display time jumped by >1.5 periods)
+	} perf;
 };
 
 /*!
