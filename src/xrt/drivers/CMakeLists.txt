@@ -131,7 +131,7 @@ if(XRT_BUILD_DRIVER_PIMAX)
 	option(PIMAX_CAM "Pimax tracking cameras and Mercury hand tracking (needs libpimax_cam.a)" OFF)
 	set(PIMAX_CAM_DIR "$ENV{HOME}/omarchyvr/rust/pimax-cam" CACHE PATH "pimax-cam crate (include/pimax_cam.h)")
 	set(PIMAX_DRIVER_SOURCES
-		pimax/pimax_hmd.c pimax/pimax_lens.c pimax/pimax_lens.h pimax/pimax_interface.h pimax/pimax_prober.c pimax/pimax_ctrl.c pimax/pimax_ctrl.h
+		pimax/pimax_hmd.c pimax/pimax_lens.c pimax/pimax_lens.h pimax/pimax_interface.h pimax/pimax_prober.c pimax/pimax_ctrl.c pimax/pimax_ctrl.h pimax/pimax_ctrltrack_shm.h
 		pimax/pimax_camera.c pimax/pimax_camera.h pimax/pimax_eyeglue.c pimax/pimax_eyeglue.h
 		)
 	if(PIMAX_USE_RUST_LIBPIMAX)

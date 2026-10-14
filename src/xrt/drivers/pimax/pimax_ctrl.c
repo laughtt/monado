@@ -10,6 +10,10 @@
  * aimed where the head looks (PIMAX_CTRL_AIM=level|head[:m]), grip pitched like a held handle (analysis/hands-desk.md).
  * PIMAX_CTRL_POSE=imu: same position, orientation from the controller IMU (accel 1024 LSB/g, gyro scale is a guess,
  * PIMAX_CTRL_GYRO_LSB_DPS, default 16.4, axes assumed == OpenXR axes).
+ * PIMAX_CTRL_TRACK=1: optical 6DoF from `pimax-ctrltrack live` (pimax-re rust/pimax-ctrltrack: controller LEDs in the
+ * camera LED frames -> pose in the head frame, seqlock file pimax_ctrltrack_shm.h). The pose is composed with the head
+ * pose at the LED frame's time and held in the tracking origin between fixes (PIMAX_CTRL_TRACK_IMU=1: the controller
+ * gyro rotates it, scale is a guess); no fix for PIMAX_CTRL_TRACK_HOLD_MS (500) -> the synthesized pose above.
  * Also offered as /interaction_profiles/ext/hand_interaction_ext (pinch = trigger, grasp = squeeze) for apps that
  * only suggest hand-interaction bindings; apps with Touch bindings keep the Touch profile.
  *
@@ -46,6 +50,7 @@
 #include "util/u_var.h"
 
 #include "pimax_ctrl.h"
+#include "pimax_ctrltrack_shm.h"
 #include "pimax_hands.h"
 
 #include <math.h>
@@ -60,6 +65,9 @@ DEBUG_GET_ONCE_FLOAT_OPTION(pimax_ctrl_gyro_lsb_dps, "PIMAX_CTRL_GYRO_LSB_DPS", 
 DEBUG_GET_ONCE_BOOL_OPTION(pimax_ctrl_hands, "PIMAX_CTRL_HANDS", true)
 DEBUG_GET_ONCE_BOOL_OPTION(pimax_ctrl_hands_demo, "PIMAX_CTRL_HANDS_DEMO", false)
 DEBUG_GET_ONCE_OPTION(pimax_ctrl_hands_feed, "PIMAX_CTRL_HANDS_FEED", "lazy")
+DEBUG_GET_ONCE_BOOL_OPTION(pimax_ctrl_track, "PIMAX_CTRL_TRACK", false)
+DEBUG_GET_ONCE_BOOL_OPTION(pimax_ctrl_track_imu, "PIMAX_CTRL_TRACK_IMU", false)
+DEBUG_GET_ONCE_NUM_OPTION(pimax_ctrl_track_hold_ms, "PIMAX_CTRL_TRACK_HOLD_MS", 500)
 
 #define ACTIVE_TIMEOUT_NS (1500ull * 1000 * 1000) // no report for this long -> inputs inactive
 #define REATTACH_MIN_NS (2500ull * 1000 * 1000)
@@ -96,6 +104,15 @@ struct pimax_ctrl_ctx
 	bool hands_demo;  // scripted input instead of reports (PIMAX_CTRL_HANDS_DEMO)
 	bool hands_eager; // PIMAX_CTRL_HANDS_FEED=report: feed Rust on the session thread (old behaviour)
 	struct xrt_pose aim_to_grip; // fixed grip pitch relative to the aim (IMU mode), from pimax-hands
+
+	// Optical 6DoF (PIMAX_CTRL_TRACK=1): poses from `pimax-ctrltrack live` (seqlock file, pimax_ctrltrack_shm.h).
+	bool track;
+	bool track_imu;       // PIMAX_CTRL_TRACK_IMU=1: controller gyro rotates the held pose between optical fixes
+	uint64_t track_hold_ns; // no fix for longer than this -> the synthesized rest pose
+	char track_path[256];
+	pthread_mutex_t track_lock; // reader (re)mapping
+	struct pimax_ctrltrack_reader track_reader;
+	uint64_t track_next_open_ns;
 
 	struct pimax_controller *ctl[2]; // [0] left (slot 2), [1] right (slot 3)
 
@@ -148,6 +165,13 @@ struct pimax_controller
 	double gyro_sum[3], acc_sum[3];
 	struct xrt_quat yaw_ref; // head yaw when the IMU tilt was seeded
 	struct xrt_quat imu_rot;
+
+	// Optical fix (lock): the last pose from pimax-ctrltrack, anchored in the tracking origin at its frame time.
+	uint64_t fix_frame_ns;           // frame_ns of the fix below (0 = none)
+	struct xrt_pose fix_world_aim;   // head pose at the frame time * body_from_aim
+	struct xrt_quat fix_imu_rot;     // imu_rot when the fix was first seen (gyro deltas)
+	struct xrt_quat fix_aim_from_imu;
+	bool fix_logged;
 
 	// Attach logic (written from the session thread and the attach thread, atomics).
 	_Atomic uint64_t last_status_ns;
@@ -259,6 +283,8 @@ static void
 ctx_unref(struct pimax_ctrl_ctx *ctx)
 {
 	if (xrt_reference_dec_and_is_zero(&ctx->ref)) {
+		pimax_ctrltrack_close(&ctx->track_reader);
+		pthread_mutex_destroy(&ctx->track_lock);
 		free(ctx);
 	}
 }
@@ -368,6 +394,102 @@ pose_from_rust(const pimax_hands_pose *p)
 	return out;
 }
 
+/*!
+ * Optical 6DoF from pimax-ctrltrack: the controller pose in the head (body) frame at the LED frame's time, composed
+ * with the head pose at that time, so it is anchored in the tracking origin and held there between fixes (the gyro
+ * may rotate it, PIMAX_CTRL_TRACK_IMU=1). False (caller uses the rest pose) when there is no fix younger than
+ * PIMAX_CTRL_TRACK_HOLD_MS.
+ */
+static bool
+optical_pose(struct pimax_controller *c, enum xrt_input_name name, struct xrt_space_relation *out)
+{
+	struct pimax_ctrl_ctx *ctx = c->ctx;
+	uint64_t now = os_monotonic_get_ns();
+	struct pimax_ctrltrack_hand hands[2];
+	bool ok = false;
+	pthread_mutex_lock(&ctx->track_lock);
+	if (ctx->track_reader.map == NULL && now >= ctx->track_next_open_ns) {
+		ctx->track_next_open_ns = now + 1000ull * 1000 * 1000;
+		if (pimax_ctrltrack_open(&ctx->track_reader, ctx->track_path)) {
+			U_LOG_IFL_I(ctx->log_level, "Pimax controllers: optical poses from %s", ctx->track_path);
+		}
+	} else if (ctx->track_reader.map != NULL && now >= ctx->track_next_open_ns) {
+		// a restarted writer creates a new file: remap when the inode changed
+		ctx->track_next_open_ns = now + 1000ull * 1000 * 1000;
+		pimax_ctrltrack_open(&ctx->track_reader, ctx->track_path);
+	}
+	ok = pimax_ctrltrack_read(&ctx->track_reader, hands);
+	pthread_mutex_unlock(&ctx->track_lock);
+	if (!ok) {
+		return false;
+	}
+	const struct pimax_ctrltrack_hand *h = &hands[c->index];
+	if (h->frame_ns == 0 || now < h->frame_ns || now - h->frame_ns > ctx->track_hold_ns) {
+		pthread_mutex_lock(&c->lock);
+		if (c->fix_logged) {
+			C_INFO(c, "optical fix lost: rest pose");
+			c->fix_logged = false;
+		}
+		pthread_mutex_unlock(&c->lock);
+		return false;
+	}
+
+	pthread_mutex_lock(&c->lock);
+	if (h->frame_ns != c->fix_frame_ns) {
+		struct xrt_pose body_aim = {
+		    .orientation = {h->quat[0], h->quat[1], h->quat[2], h->quat[3]},
+		    .position = {h->pos[0], h->pos[1], h->pos[2]},
+		};
+		math_quat_normalize(&body_aim.orientation);
+		struct xrt_space_relation head = XRT_SPACE_RELATION_ZERO;
+		struct xrt_pose world_head = XRT_POSE_IDENTITY;
+		if (ctx->head != NULL &&
+		    xrt_device_get_tracked_pose(ctx->head, XRT_INPUT_GENERIC_HEAD_POSE, (int64_t)h->frame_ns, &head) ==
+		        XRT_SUCCESS &&
+		    (head.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) != 0) {
+			world_head = head.pose;
+			math_quat_normalize(&world_head.orientation);
+		}
+		math_pose_transform(&world_head, &body_aim, &c->fix_world_aim);
+		c->fix_imu_rot = c->imu_rot;
+		c->fix_aim_from_imu = (struct xrt_quat){h->aim_from_imu[0], h->aim_from_imu[1], h->aim_from_imu[2],
+		                                        h->aim_from_imu[3]};
+		math_quat_normalize(&c->fix_aim_from_imu);
+		c->fix_frame_ns = h->frame_ns;
+		if (!c->fix_logged) {
+			C_INFO(c, "optical fix: head-frame position (%.3f %.3f %.3f) m, %u LEDs on %u cameras, %.2f px",
+			       h->pos[0], h->pos[1], h->pos[2], h->leds, h->cams, h->rms_px);
+			c->fix_logged = true;
+		}
+	}
+	struct xrt_pose pose = c->fix_world_aim;
+	if (ctx->track_imu && c->bias_done) {
+		// Gyro rotation since the fix, moved into the aim frame: aim_from_imu * (fix^-1 * now) * imu_from_aim.
+		struct xrt_quat inv_fix, d, a2i, tmp;
+		math_quat_invert(&c->fix_imu_rot, &inv_fix);
+		math_quat_rotate(&inv_fix, &c->imu_rot, &d);
+		math_quat_invert(&c->fix_aim_from_imu, &a2i);
+		math_quat_rotate(&c->fix_aim_from_imu, &d, &tmp);
+		math_quat_rotate(&tmp, &a2i, &d);
+		math_quat_rotate(&pose.orientation, &d, &pose.orientation);
+		math_quat_normalize(&pose.orientation);
+	}
+	pthread_mutex_unlock(&c->lock);
+
+	if (name == XRT_INPUT_TOUCH_GRIP_POSE) {
+		struct xrt_quat a2g = ctx->aim_to_grip.orientation;
+		math_quat_rotate(&pose.orientation, &a2g, &pose.orientation);
+		math_quat_normalize(&pose.orientation);
+	}
+	struct xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
+	rel.pose = pose;
+	rel.relation_flags = (enum xrt_space_relation_flags)(
+	    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT |
+	    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
+	*out = rel;
+	return true;
+}
+
 static xrt_result_t
 pimax_ctl_get_tracked_pose(struct xrt_device *xdev,
                            enum xrt_input_name name,
@@ -378,6 +500,10 @@ pimax_ctl_get_tracked_pose(struct xrt_device *xdev,
 	if (name != XRT_INPUT_TOUCH_GRIP_POSE && name != XRT_INPUT_TOUCH_AIM_POSE) {
 		U_LOG_XDEV_UNSUPPORTED_INPUT(&c->base, c->ctx->log_level, name);
 		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
+
+	if (c->ctx->track && optical_pose(c, name, out_relation)) {
+		return XRT_SUCCESS;
 	}
 
 	// Synthesized placement (rust/pimax-hands rest.rs) from the head orientation at that time.
@@ -638,7 +764,7 @@ pimax_ctrl_on_report(struct pimax_ctrl_ctx *ctx, const pimax_controller_report *
 			hands_drain_locked(c);
 		}
 	}
-	if (ctx->imu_mode) {
+	if (ctx->imu_mode || ctx->track_imu) {
 		imu_update(c, r, now);
 	}
 	pthread_mutex_unlock(&c->lock);
@@ -797,8 +923,8 @@ ctl_create(struct pimax_ctrl_ctx *ctx, int index)
 	snprintf(c->base.serial, XRT_DEVICE_NAME_LEN, "pimax-ctrl-%s", left ? "left" : "right");
 	c->base.binding_profiles = left ? profiles_left : profiles_right;
 	c->base.binding_profile_count = ARRAY_SIZE(profiles_left);
-	c->base.supported.orientation_tracking = ctx->imu_mode;
-	c->base.supported.position_tracking = false;
+	c->base.supported.orientation_tracking = ctx->imu_mode || ctx->track;
+	c->base.supported.position_tracking = ctx->track;
 	c->base.supported.battery_status = true;
 
 	if (ctx->hands) {
@@ -867,6 +993,18 @@ pimax_ctrl_create(struct xrt_device *head, enum u_logging_level log_level, struc
 	ctx->hands_demo = ctx->hands && debug_get_bool_option_pimax_ctrl_hands_demo();
 	const char *feed = debug_get_option_pimax_ctrl_hands_feed();
 	ctx->hands_eager = ctx->hands && feed != NULL && strcmp(feed, "report") == 0;
+	ctx->track = debug_get_bool_option_pimax_ctrl_track();
+	ctx->track_imu = ctx->track && debug_get_bool_option_pimax_ctrl_track_imu();
+	long hold_ms = debug_get_num_option_pimax_ctrl_track_hold_ms();
+	ctx->track_hold_ns = (uint64_t)(hold_ms > 0 ? hold_ms : 500) * 1000ull * 1000ull;
+	pthread_mutex_init(&ctx->track_lock, NULL);
+	pimax_ctrltrack_default_path(ctx->track_path, sizeof(ctx->track_path));
+	if (ctx->track) {
+		U_LOG_IFL_I(log_level,
+		            "Pimax controllers: optical 6DoF on (PIMAX_CTRL_TRACK=1): poses from %s (pimax-ctrltrack live), "
+		            "held %ld ms, then the rest pose; gyro between fixes %s",
+		            ctx->track_path, hold_ms, ctx->track_imu ? "on (scale is a guess)" : "off");
+	}
 	pimax_hands_pose a2g;
 	pimax_hands_aim_to_grip(&a2g);
 	ctx->aim_to_grip = pose_from_rust(&a2g);
