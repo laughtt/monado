@@ -32,6 +32,11 @@ struct pimax_camera_clock_ref
 
 typedef bool (*pimax_camera_clock_fn)(void *user, struct pimax_camera_clock_ref *out);
 
+/*!
+ * 3DoF orientation of the IMU (OpenXR axes) at @p ts_ns from the HMD's own filter, for the 6DoF supervisor.
+ */
+typedef bool (*pimax_camera_orient_fn)(void *user, int64_t ts_ns, struct xrt_quat *out);
+
 struct pimax_camera;
 
 /*!
@@ -46,14 +51,51 @@ struct pimax_camera;
  *  - PIMAX_HT_HEAD_OFFSET="x,y,z": head origin in the IMU body frame in metres (default: between the two tracking
  *    cameras, 5 cm behind them).
  *  - PIMAX_HT_STATS=1: log Mercury's processed-pair rate (needs HTA_PREDICTION_DISABLE=1; test aid).
+ *  - PIMAX_SLAM=1: 6DoF head tracking with Monado's SLAM tracker (VIT library, default libbasalt.so, see
+ *    VIT_SYSTEM_LIBRARY_PATH) fed by the cameras PIMAX_SLAM_CAMS (default "0,1") and the IMU; falls back to 3DoF
+ *    while the tracker is not trustworthy. SLAM_CONFIG (optional) overrides the calibration we hand over.
+ *  - PIMAX_SLAM_RECORD=<dir> or 1: record a EuRoC dataset (cameras PIMAX_SLAM_CAMS + IMU, same clock) for offline
+ *    replay into <dir>/euroc_<datetime>/mav0, with <dir>/pimax-basalt-calib.json + pimax-slam-info.json. Works
+ *    without PIMAX_SLAM and without Basalt. "1" = ~/.local/share/pimax/slam-recordings/<date>-<time>.
+ *  - PIMAX_SLAM_CAM_OFFSET_US: added to every camera timestamp sent to the tracker/recorder (camera-IMU time offset
+ *    test knob, default 0).
+ *  - PIMAX_SLAM_IMU=<json>: IMU noise model (default ~/.config/pimax/slam-imu.json, else built-in defaults).
  *
- * @p clock (may be NULL) gives the HMD's IMU clock so frames share the IMU timeline.
+ * @p clock (may be NULL) gives the HMD's IMU clock so frames share the IMU timeline. @p orient (may be NULL)
+ * gives the 3DoF orientation history (needed for 6DoF).
  */
 struct pimax_camera *
 pimax_camera_create(struct xrt_device *hmd,
                     enum u_logging_level log_level,
                     pimax_camera_clock_fn clock,
-                    void *clock_user);
+                    void *clock_user,
+                    pimax_camera_orient_fn orient,
+                    void *orient_user);
+
+/*!
+ * True when the camera pipeline wants IMU samples (SLAM tracking or recording active).
+ */
+bool
+pimax_camera_wants_imu(const struct pimax_camera *pc);
+
+/*!
+ * One IMU sample (1 kHz, IMU clock in CLOCK_MONOTONIC ns, OpenXR head axes = PIMAX_AXIS_MODE 1, not bias
+ * corrected). Called from the HMD's IMU thread.
+ */
+void
+pimax_camera_push_imu(struct pimax_camera *pc, int64_t ts_ns, const struct xrt_vec3 *accel_m_s2,
+                      const struct xrt_vec3 *gyro_rad_s);
+
+/*!
+ * Head relation with 6DoF: given the HMD's 3DoF relation at @p at_ns, write the relation to report. Returns false
+ * when 6DoF is not active (report @p rel3dof unchanged). While the tracker is trusted the result is the SLAM pose
+ * (predicted to @p at_ns); otherwise the 3DoF orientation (heading kept continuous) at the last good position.
+ */
+bool
+pimax_camera_head_relation(struct pimax_camera *pc,
+                           int64_t at_ns,
+                           const struct xrt_space_relation *rel3dof,
+                           struct xrt_space_relation *out);
 
 /*!
  * The hand-tracking device (attached to the HMD pose), or NULL. Ownership moves to the caller (the system destroys

@@ -113,8 +113,10 @@ struct pimax_hmd
 	//! IMU clock snapshot for the cameras (written by the IMU callback).
 	struct os_mutex clk_lock;
 	struct pimax_camera_clock_ref clk;
-	//! Tracking cameras + Mercury (NULL unless PIMAX_HANDS / PIMAX_CAM).
+	//! Tracking cameras + Mercury + 6DoF (NULL unless PIMAX_HANDS / PIMAX_CAM / PIMAX_SLAM / PIMAX_SLAM_RECORD).
+	//! The IMU thread reads it under cam_lock (it is set after the session thread is running).
 	struct pimax_camera *camera;
+	struct os_mutex cam_lock;
 };
 
 static inline struct pimax_hmd *
@@ -174,6 +176,24 @@ sample_time_ns(struct pimax_hmd *hmd, uint32_t dev_ts_us)
 	hmd->clk.valid = 1;
 	os_mutex_unlock(&hmd->clk_lock);
 	return t;
+}
+
+//! 6DoF supervisor: the 3DoF orientation history.
+static bool
+pimax_hmd_orient_at(void *user, int64_t ts_ns, struct xrt_quat *out)
+{
+	struct pimax_hmd *hmd = (struct pimax_hmd *)user;
+	if (!hmd->bias_done) {
+		return false;
+	}
+	struct xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
+	m_relation_history_get(hmd->relation_hist, ts_ns, &rel);
+	if ((rel.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) == 0) {
+		return false;
+	}
+	*out = rel.pose.orientation;
+	math_quat_normalize(out);
+	return true;
 }
 
 //! Camera thread: the IMU device-clock -> monotonic mapping, so frames share the IMU timeline.
@@ -382,6 +402,20 @@ pimax_on_imu(void *user, const pimax_imu_sample *s)
 	struct pimax_hmd *hmd = (struct pimax_hmd *)user;
 	uint64_t ts_ns = sample_time_ns(hmd, s->ts_us);
 
+	float a[3] = {s->accel_g[0] * 9.80665f, s->accel_g[1] * 9.80665f, s->accel_g[2] * 9.80665f};
+	float g[3] = {s->gyro_dps[0] * (float)(M_PI / 180.0), s->gyro_dps[1] * (float)(M_PI / 180.0),
+	              s->gyro_dps[2] * (float)(M_PI / 180.0)};
+	struct xrt_vec3 accel, gyro;
+	map_axes(hmd, a, &accel);
+	map_axes(hmd, g, &gyro);
+
+	// 6DoF tracker / EuRoC recorder: every sample, raw (the tracker estimates its own biases).
+	os_mutex_lock(&hmd->cam_lock);
+	if (pimax_camera_wants_imu(hmd->camera)) {
+		pimax_camera_push_imu(hmd->camera, (int64_t)ts_ns, &accel, &gyro);
+	}
+	os_mutex_unlock(&hmd->cam_lock);
+
 	if (!hmd->bias_done) {
 		if (!bias_feed(hmd, s) && ++hmd->total_n >= hmd->timeout_n) {
 			bias_timeout(hmd, s->accel_g);
@@ -391,13 +425,6 @@ pimax_on_imu(void *user, const pimax_imu_sample *s)
 	if (hmd->bias_fallback) {
 		bias_feed(hmd, s);
 	}
-
-	float a[3] = {s->accel_g[0] * 9.80665f, s->accel_g[1] * 9.80665f, s->accel_g[2] * 9.80665f};
-	float g[3] = {s->gyro_dps[0] * (float)(M_PI / 180.0), s->gyro_dps[1] * (float)(M_PI / 180.0),
-	              s->gyro_dps[2] * (float)(M_PI / 180.0)};
-	struct xrt_vec3 accel, gyro;
-	map_axes(hmd, a, &accel);
-	map_axes(hmd, g, &gyro);
 
 	m_imu_3dof_update(&hmd->fusion, ts_ns, &accel, &gyro);
 
@@ -421,8 +448,13 @@ pimax_hmd_destroy(struct xrt_device *xdev)
 {
 	struct pimax_hmd *hmd = pimax_hmd(xdev);
 
-	// Cameras first: their thread reads the IMU clock snapshot and pushes into Mercury.
-	pimax_camera_destroy(&hmd->camera);
+	// Cameras first: their thread reads the IMU clock snapshot and pushes into Mercury. Unpublish the pointer
+	// under cam_lock so an IMU callback in flight finishes before the pipeline goes away.
+	os_mutex_lock(&hmd->cam_lock);
+	struct pimax_camera *camera = hmd->camera;
+	hmd->camera = NULL;
+	os_mutex_unlock(&hmd->cam_lock);
+	pimax_camera_destroy(&camera);
 
 	// Stop the controller attach thread, then the session thread (and with it the callbacks) before freeing anything.
 	if (hmd->ctrl != NULL) {
@@ -443,6 +475,7 @@ pimax_hmd_destroy(struct xrt_device *xdev)
 	m_imu_3dof_close(&hmd->fusion);
 	m_relation_history_destroy(&hmd->relation_hist);
 	os_mutex_destroy(&hmd->clk_lock);
+	os_mutex_destroy(&hmd->cam_lock);
 	u_device_free(&hmd->base);
 }
 
@@ -470,6 +503,12 @@ pimax_hmd_get_tracked_pose(struct xrt_device *xdev,
 
 	if ((relation.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) != 0) {
 		math_quat_normalize(&relation.pose.orientation);
+	}
+
+	// 6DoF (PIMAX_SLAM=1): the tracker's pose while it is trusted, else 3DoF at the held position.
+	struct xrt_space_relation rel6;
+	if (pimax_camera_head_relation(hmd->camera, at_timestamp_ns, &relation, &rel6)) {
+		relation = rel6;
 	}
 
 	*out_relation = relation;
@@ -553,6 +592,7 @@ pimax_hmd_create(struct xrt_device *out_ctrls[2])
 		HMD_INFO(hmd, "PIMAX_DEBUG_PTRACE=1: same-user debuggers may attach to this process");
 	}
 	os_mutex_init(&hmd->clk_lock);
+	os_mutex_init(&hmd->cam_lock);
 	hmd->axis_mode = (int)debug_get_num_option_pimax_axis_mode();
 	long bias_ms = debug_get_num_option_pimax_bias_ms();
 	hmd->bias_target = (uint32_t)(bias_ms < 200 ? 200 : bias_ms); // 1 kHz IMU: ms == samples
@@ -662,7 +702,7 @@ pimax_hmd_create(struct xrt_device *out_ctrls[2])
 			}
 		}
 		// Cameras still work (live UVC or a PIMAX_CAM_SOURCE replay), timed without the IMU clock.
-		hmd->camera = pimax_camera_create(&hmd->base, hmd->log_level, NULL, NULL);
+		hmd->camera = pimax_camera_create(&hmd->base, hmd->log_level, NULL, NULL, NULL, NULL);
 		return &hmd->base;
 	}
 
@@ -724,7 +764,11 @@ pimax_hmd_create(struct xrt_device *out_ctrls[2])
 	u_var_add_f32(hmd, &hmd->bias_dps[2], "bias z dps");
 
 	// Tracking cameras and Mercury hands (PIMAX_HANDS=mercury or PIMAX_CAM=1); NULL otherwise.
-	hmd->camera = pimax_camera_create(&hmd->base, hmd->log_level, pimax_hmd_clock_ref, hmd);
+	struct pimax_camera *camera =
+	    pimax_camera_create(&hmd->base, hmd->log_level, pimax_hmd_clock_ref, hmd, pimax_hmd_orient_at, hmd);
+	os_mutex_lock(&hmd->cam_lock);
+	hmd->camera = camera;
+	os_mutex_unlock(&hmd->cam_lock);
 
 	HMD_INFO(hmd, "Pimax Dream Air up: keep the headset still for %u ms for gyro calibration (axis mode %d)",
 	         hmd->bias_target, hmd->axis_mode);

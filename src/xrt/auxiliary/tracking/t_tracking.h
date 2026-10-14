@@ -753,6 +753,24 @@ t_slam_create(struct xrt_frame_context *xfctx,
 int
 t_slam_start(struct xrt_tracked_slam *xts);
 
+/*!
+ * Newest pose the SLAM system produced (no prediction): IMU pose in the tracker's world and its timestamp.
+ * Returns false when there is no pose yet. Drivers use it to judge tracking health (VIT has no "lost" flag).
+ *
+ * @public @memberof xrt_tracked_slam
+ */
+bool
+t_slam_get_latest_pose(struct xrt_tracked_slam *xts, int64_t *out_ts_ns, struct xrt_space_relation *out_relation);
+
+/*!
+ * Reset the SLAM system's state (VIT tracker_reset); it re-initialises from the next frames.
+ * Returns 0 on success.
+ *
+ * @public @memberof xrt_tracked_slam
+ */
+int
+t_slam_reset(struct xrt_tracked_slam *xts);
+
 /*
  *
  * Camera calibration
