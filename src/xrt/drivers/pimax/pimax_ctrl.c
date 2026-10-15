@@ -118,6 +118,11 @@ struct pimax_ctrl_ctx
 
 	struct pimax_controller *ctl[2]; // [0] left (slot 2), [1] right (slot 3)
 
+	// Haptics (PIMAX_HAPTICS): the HMD's session, set by pimax_ctrl_start, cleared by pimax_ctrl_stop. set_output runs
+	// on IPC/compositor threads; it only queues into libpimax (the session thread writes, rate limited).
+	_Atomic(pimax_t *) hap_lib;
+	atomic_uint hap_calls;
+
 	// Attach thread.
 	pimax_t *lib;
 	pthread_t thread;
@@ -669,10 +674,29 @@ pimax_ctl_get_hand_tracking(struct xrt_device *xdev,
 	return XRT_SUCCESS;
 }
 
+/*!
+ * PIMAX_HAPTICS: OpenXR vibration -> cmd 0x07 `58 09 07 SS AMP DUR_lo DUR_hi` (Windows capture 2026-10-15). libpimax
+ * maps amplitude 0..1 -> 1..100 %, duration ns -> ms (XR_MIN_HAPTIC_DURATION -> 12 ms, what games stream), ignores the
+ * frequency (not in the protocol), and sends at most one command per 8 ms per hand (newest wins) on its session
+ * thread. A stop (amplitude 0) sends nothing, like Pimax Play: the pulse just ends.
+ */
 static xrt_result_t
 pimax_ctl_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value)
 {
-	return XRT_SUCCESS; // haptics: protocol unknown, no-op
+	struct pimax_controller *c = ctl(xdev);
+	if (name != XRT_OUTPUT_NAME_TOUCH_HAPTIC || value == NULL || value->type != XRT_OUTPUT_VALUE_TYPE_VIBRATION) {
+		return XRT_SUCCESS;
+	}
+	pimax_t *lib = atomic_load(&c->ctx->hap_lib);
+	if (lib == NULL) {
+		return XRT_SUCCESS; // not started yet / stopping
+	}
+	int rc = pimax_haptic(lib, c->slot, value->vibration.amplitude, value->vibration.duration_ns);
+	if (atomic_fetch_add(&c->ctx->hap_calls, 1) == 0) {
+		U_LOG_IFL_I(c->ctx->log_level, "PIMAX_HAPTICS: first vibration (slot %u, amplitude %.2f, %lld ns) -> %d",
+		            c->slot, value->vibration.amplitude, (long long)value->vibration.duration_ns, rc);
+	}
+	return XRT_SUCCESS;
 }
 
 static xrt_result_t
@@ -870,6 +894,13 @@ attach_thread(void *arg)
 				do_attach(ctx, c, "0x37 heartbeat without reports");
 			}
 		}
+		// Test pulse from the app / `pimax controllers buzz` ($XDG_RUNTIME_DIR/pimax-haptic-request).
+		int hs = pimax_haptic_poll_request(ctx->lib);
+		if (hs > 0) {
+			U_LOG_IFL_I(ctx->log_level, "PIMAX_HAPTICS: test pulse on slot %d (app request)", hs);
+		} else if (hs < 0) {
+			U_LOG_IFL_W(ctx->log_level, "PIMAX_HAPTICS: malformed test pulse request ignored");
+		}
 		struct timespec ts = {0, 100 * 1000 * 1000};
 		nanosleep(&ts, NULL);
 	}
@@ -880,6 +911,8 @@ void
 pimax_ctrl_start(struct pimax_ctrl_ctx *ctx, pimax_t *lib)
 {
 	ctx->lib = lib;
+	atomic_store(&ctx->hap_lib, lib);
+	U_LOG_IFL_I(ctx->log_level, "PIMAX_HAPTICS: controller vibration on (cmd 0x07, <= 1 command per 8 ms per hand)");
 	atomic_store(&ctx->stop, false);
 	if (pthread_create(&ctx->thread, NULL, attach_thread, ctx) == 0) {
 		ctx->thread_running = true;
@@ -894,6 +927,7 @@ pimax_ctrl_stop(struct pimax_ctrl_ctx *ctx)
 	if (ctx == NULL) {
 		return;
 	}
+	atomic_store(&ctx->hap_lib, NULL);
 	if (ctx->thread_running) {
 		atomic_store(&ctx->stop, true);
 		pthread_join(ctx->thread, NULL);

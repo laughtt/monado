@@ -1965,22 +1965,28 @@ CServerDriver_Monado::HandleHapticEvent(vr::VREvent_t *event)
 	float amp = event->data.hapticVibration.fAmplitude;
 	float duration = event->data.hapticVibration.fDurationSeconds;
 
-	ovrd_log("Haptic vibration %fs %fHz %famp\n", duration, freq, amp);
+	// Games stream a pulse every few ms: log only the first one (the per-event lines flooded vrserver.txt).
+	static bool logged_once = false;
+	if (!logged_once) {
+		logged_once = true;
+		ovrd_log("Haptic vibration %fs %fHz %famp (first event; later ones are not logged)\n", duration, freq,
+		         amp);
+	}
 
 	CDeviceDriver_Monado_Controller *controller = NULL;
 
 	if (m_left && m_left->m_ulPropertyContainer == event->data.hapticVibration.containerHandle) {
 		controller = m_left;
-		ovrd_log("Haptic vibration left\n");
 	} else if (m_right && m_right->m_ulPropertyContainer == event->data.hapticVibration.containerHandle) {
 		controller = m_right;
-		ovrd_log("Haptic vibration right\n");
 	} else {
 		ovrd_log("Haptic vibration ignored\n");
 		return;
 	}
 
-	struct xrt_output_value out;
+	// Zero-initialised with its type: drivers check value->type (it was left uninitialised).
+	struct xrt_output_value out = {};
+	out.type = XRT_OUTPUT_VALUE_TYPE_VIBRATION;
 	out.vibration.amplitude = amp;
 	if (duration > 0.00001) {
 		out.vibration.duration_ns = (time_duration_ns)(duration * 1000.f * 1000.f * 1000.f);
@@ -1998,7 +2004,6 @@ CServerDriver_Monado::HandleHapticEvent(vr::VREvent_t *event)
 	SteamVRDriverControlOutput *control = &controller->m_output_controls.at(0);
 
 	enum xrt_output_name name = control->monado_output_name;
-	ovrd_log("Haptic vibration %s, %d\n", control->steamvr_control_path, name);
 	controller->m_xdev->set_output(controller->m_xdev, name, &out);
 }
 
