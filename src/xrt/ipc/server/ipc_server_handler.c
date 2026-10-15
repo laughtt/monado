@@ -28,6 +28,11 @@
 #include <unistd.h>
 #endif
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
 
 /*
  *
@@ -1498,6 +1503,62 @@ ipc_handle_compositor_set_thread_hint(volatile struct ipc_client_state *ics,
 	return xrt_comp_set_thread_hint(ics->xc, hint, thread_id);
 }
 
+/*!
+ * Pimax room setup (pimax-re docs/ROOM-SETUP.md, marker PIMAX_STAGE_BOUNDS): the play area of the saved room as the
+ * STAGE bounds rectangle. `pimax-roommap` writes $PIMAX_STAGE_BOUNDS_FILE (default $XDG_RUNTIME_DIR/pimax-stage-bounds)
+ * once it has put the room in place for this process (the room anchor offset makes the STAGE origin the play area's
+ * centre on the floor, -Z its forward):
+ *
+ *     pimax-stage-bounds 1
+ *     pid <this monado-service pid>
+ *     size <width x m> <depth z m>
+ *
+ * Read on every call (apps ask rarely). Another pid, a missing file or a size outside 0.3-50 m: no bounds (the
+ * compositor's answer, usually XR_SPACE_BOUNDS_UNAVAILABLE), as before.
+ */
+static bool
+pimax_stage_bounds(struct xrt_vec2 *out)
+{
+	char path[512];
+	const char *f = getenv("PIMAX_STAGE_BOUNDS_FILE");
+	if (f == NULL || f[0] == '\0') {
+		const char *rt = getenv("XDG_RUNTIME_DIR");
+		if (rt == NULL || rt[0] == '\0') {
+			return false;
+		}
+		snprintf(path, sizeof(path), "%s/pimax-stage-bounds", rt);
+		f = path;
+	}
+	FILE *fp = fopen(f, "r");
+	if (fp == NULL) {
+		return false;
+	}
+	char line[160];
+	bool magic = false;
+	unsigned int pid = 0;
+	float w = 0.0f, d = 0.0f;
+	while (fgets(line, sizeof(line), fp) != NULL) {
+		if (strncmp(line, "pimax-stage-bounds 1", 20) == 0) {
+			magic = true;
+		}
+		(void)sscanf(line, "pid %u", &pid);
+		(void)sscanf(line, "size %f %f", &w, &d);
+	}
+	fclose(fp);
+	if (!magic || pid != (unsigned int)getpid() || !(w >= 0.3f && w <= 50.0f) || !(d >= 0.3f && d <= 50.0f)) {
+		return false;
+	}
+	static float logged_w = 0.0f, logged_d = 0.0f;
+	if (w != logged_w || d != logged_d) {
+		logged_w = w;
+		logged_d = d;
+		U_LOG_I("PIMAX_STAGE_BOUNDS: STAGE bounds %.2f x %.2f m from %s", w, d, f);
+	}
+	out->x = w;
+	out->y = d;
+	return true;
+}
+
 xrt_result_t
 ipc_handle_compositor_get_reference_bounds_rect(volatile struct ipc_client_state *ics,
                                                 enum xrt_reference_space_type reference_space_type,
@@ -1507,6 +1568,10 @@ ipc_handle_compositor_get_reference_bounds_rect(volatile struct ipc_client_state
 
 	if (ics->xc == NULL) {
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+
+	if (reference_space_type == XRT_SPACE_REFERENCE_TYPE_STAGE && pimax_stage_bounds(bounds)) {
+		return XRT_SUCCESS;
 	}
 
 	return xrt_comp_get_reference_bounds_rect(ics->xc, reference_space_type, bounds);
