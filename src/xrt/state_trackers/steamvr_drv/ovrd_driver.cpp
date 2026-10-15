@@ -57,6 +57,10 @@ DEBUG_GET_ONCE_BOOL_OPTION(emulate_index_controller, "STEAMVR_EMULATE_INDEX_CONT
 
 DEBUG_GET_ONCE_NUM_OPTION(scale_percentage, "XRT_COMPOSITOR_SCALE_PERCENTAGE", 140)
 
+//! Pimax 6DoF head tracking (camera SLAM) is on for this session (from PIMAX_STEAMVR_ENV). The HMD device itself says
+//! position_tracking = false (it falls back to 3DoF while the tracker is not trusted), so it is read here.
+DEBUG_GET_ONCE_BOOL_OPTION(pimax_slam_head, "PIMAX_SLAM", false)
+
 /*!
  * PIMAX_STEAMVR_ENV: vrserver does not get the environment `pimax vr start` gives monado-service, so the driver reads
  * the same Pimax settings from $PIMAX_STEAMVR_ENV_FILE, else ~/.config/pimax/steamvr-driver.env (KEY=VALUE lines,
@@ -141,6 +145,9 @@ struct SteamVRDriverControlInput : SteamVRDriverControl
 	enum xrt_input_name monado_input_name;
 
 	struct MonadoInputComponent component;
+
+	//! >= 0: a boolean SteamVR component fed by (scalar input > threshold), e.g. /input/grip/touch from the squeeze.
+	float bool_threshold = -1.f;
 };
 
 struct SteamVRDriverControlOutput : SteamVRDriverControl
@@ -176,9 +183,10 @@ apply_pose(struct xrt_space_relation *rel, vr::DriverPose_t *m_pose)
 		m_pose->poseIsValid = false;
 	}
 
-	if ((rel->relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0) {
+	// VALID, not TRACKED: a held position (6DoF tracker lost, 3DoF fallback at the last position) must stay where it
+	// is; with TRACKED the pose snapped to the origin (0,0,0 + floor offset) whenever the tracker dropped out.
+	if ((rel->relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0) {
 		copy_vec3(&rel->pose.position, m_pose->vecPosition);
-	} else {
 	}
 
 	if ((rel->relation_flags & XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT) != 0) {
@@ -458,6 +466,15 @@ public:
 			}
 			break;
 		case XRT_DEVICE_TOUCH_CONTROLLER:
+			if (strstr(xdev->str, "Pimax") != NULL) {
+				// Pimax Dream Air controllers: presented as Oculus Touch (see AddPimaxTouchControls). The Quest 2
+				// model is the one SteamVR's own Touch profile simulates, and it carries the pose components
+				// (tip, base, handgrip, openxr_grip/aim) that game bindings for oculus_touch use.
+				m_pimax_touch = true;
+				m_render_model = hand == XRT_HAND_LEFT ? "oculus_quest2_controller_left"
+				                                       : "oculus_quest2_controller_right";
+				break;
+			}
 			if (hand == XRT_HAND_LEFT) {
 				m_render_model = "oculus_cv1_controller_left";
 			}
@@ -486,6 +503,16 @@ public:
 		}
 
 		ovrd_log("Render model based on Monado: %s\n", m_render_model);
+
+		if (m_pimax_touch) {
+			// oculus_quest2_controller_<hand>.json "openxr_grip": origin (+-0.007, -0.00182941, 0.1019482) (x is
+			// +0.007 on the left model, -0.007 on the right), rotate_xyz (20.6, 0, 0) degrees.
+			struct xrt_pose grip_in_raw = XRT_POSE_IDENTITY;
+			grip_in_raw.position = {hand == XRT_HAND_LEFT ? 0.007f : -0.007f, -0.00182941f, 0.1019482f};
+			const struct xrt_vec3 x_axis = {1.f, 0.f, 0.f};
+			math_quat_from_angle_vector((float)(20.6 * M_PI / 180.0), &x_axis, &grip_in_raw.orientation);
+			math_pose_invert(&grip_in_raw, &m_raw_from_grip);
+		}
 
 		vr::VRServerDriverHost()->TrackedDeviceAdded(GetSerialNumber().c_str(),
 		                                             vr::TrackedDeviceClass_Controller, this);
@@ -558,7 +585,8 @@ public:
 	void
 	AddSkeletonControl(const char *steamvr_skeleton_name,
 	                   const char *steamvr_control_path,
-	                   enum xrt_input_name monado_input_name)
+	                   enum xrt_input_name monado_input_name,
+	                   vr::EVRSkeletalTrackingLevel level = vr::VRSkeletalTracking_Full)
 	{
 		enum xrt_input_type monado_input_type = XRT_GET_INPUT_TYPE(monado_input_name);
 
@@ -570,8 +598,8 @@ public:
 		in.component.has_component = false;
 
 		vr::EVRInputError err = vr::VRDriverInput()->CreateSkeletonComponent(
-		    m_ulPropertyContainer, steamvr_skeleton_name, steamvr_control_path, "/pose/raw",
-		    vr::VRSkeletalTracking_Full, NULL, OPENVR_BONE_COUNT, &in.control_handle);
+		    m_ulPropertyContainer, steamvr_skeleton_name, steamvr_control_path, "/pose/raw", level, NULL,
+		    OPENVR_BONE_COUNT, &in.control_handle);
 		if (err) {
 			ovrd_log("Error adding skeletal input: %i", err);
 			return;
@@ -748,6 +776,105 @@ public:
 		}
 	}
 
+	bool
+	HasInput(enum xrt_input_name name) const
+	{
+		for (uint32_t ii = 0; ii < m_xdev->input_count; ii++) {
+			if (m_xdev->inputs[ii].name == name) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void
+	AddControlIfPresent(const char *steamvr_path, enum xrt_input_name name, struct MonadoInputComponent *component)
+	{
+		if (!HasInput(name)) {
+			ovrd_log("%s: no input for %s, not registered\n", m_xdev->str, steamvr_path);
+			return;
+		}
+		AddControl(steamvr_path, name, component);
+	}
+
+	/*!
+	 * Pimax Dream Air controllers as Oculus Touch, exactly the input set of SteamVR's own Touch profile
+	 * ({oculus}/input/touch_profile.json, shipped with SteamVR): games ship default bindings for oculus_touch, SteamVR
+	 * has a legacy (OpenVR 1) binding and a compositor binding for it, and its binding UI knows the buttons.
+	 * Physical -> SteamVR: trigger -> /input/trigger (value, touch); grip -> /input/grip (value, touch = squeezed);
+	 * stick -> /input/joystick (x, y, click, touch); X/Y (left), A/B (right) -> /input/x|y|a|b (click, touch);
+	 * menu button (either hand) -> /input/system/click (SteamVR dashboard); haptics -> /output/haptic;
+	 * finger curl from trigger/grip/touch (pimax-hands, XRT_INPUT_HT_CONFORMING_*) -> /input/skeleton/<hand>.
+	 * The Touch thumbrest has no Pimax counterpart and is not registered.
+	 */
+	void
+	AddPimaxTouchControls()
+	{
+		const bool left = m_hand == XRT_HAND_LEFT;
+		struct MonadoInputComponent x = {true, true, false};
+		struct MonadoInputComponent y = {true, false, true};
+
+		AddControlIfPresent("/input/trigger/value", XRT_INPUT_TOUCH_TRIGGER_VALUE, NULL);
+		AddControlIfPresent("/input/trigger/touch", XRT_INPUT_TOUCH_TRIGGER_TOUCH, NULL);
+
+		AddControlIfPresent("/input/grip/value", XRT_INPUT_TOUCH_SQUEEZE_VALUE, NULL);
+		if (HasInput(XRT_INPUT_TOUCH_SQUEEZE_VALUE)) {
+			AddThresholdBool("/input/grip/touch", XRT_INPUT_TOUCH_SQUEEZE_VALUE, 0.05f);
+		}
+
+		AddControlIfPresent("/input/joystick/x", XRT_INPUT_TOUCH_THUMBSTICK, &x);
+		AddControlIfPresent("/input/joystick/y", XRT_INPUT_TOUCH_THUMBSTICK, &y);
+		AddControlIfPresent("/input/joystick/click", XRT_INPUT_TOUCH_THUMBSTICK_CLICK, NULL);
+		AddControlIfPresent("/input/joystick/touch", XRT_INPUT_TOUCH_THUMBSTICK_TOUCH, NULL);
+
+		if (left) {
+			AddControlIfPresent("/input/x/click", XRT_INPUT_TOUCH_X_CLICK, NULL);
+			AddControlIfPresent("/input/x/touch", XRT_INPUT_TOUCH_X_TOUCH, NULL);
+			AddControlIfPresent("/input/y/click", XRT_INPUT_TOUCH_Y_CLICK, NULL);
+			AddControlIfPresent("/input/y/touch", XRT_INPUT_TOUCH_Y_TOUCH, NULL);
+		} else {
+			AddControlIfPresent("/input/a/click", XRT_INPUT_TOUCH_A_CLICK, NULL);
+			AddControlIfPresent("/input/a/touch", XRT_INPUT_TOUCH_A_TOUCH, NULL);
+			AddControlIfPresent("/input/b/click", XRT_INPUT_TOUCH_B_CLICK, NULL);
+			AddControlIfPresent("/input/b/touch", XRT_INPUT_TOUCH_B_TOUCH, NULL);
+		}
+
+		// The menu button: the driver names it MENU_CLICK on the left, SYSTEM_CLICK on the right. On Touch the left
+		// menu button is SteamVR's system button (dashboard); here both hands' menu buttons open the dashboard.
+		if (HasInput(XRT_INPUT_TOUCH_MENU_CLICK)) {
+			AddControl("/input/system/click", XRT_INPUT_TOUCH_MENU_CLICK, NULL);
+		} else {
+			AddControlIfPresent("/input/system/click", XRT_INPUT_TOUCH_SYSTEM_CLICK, NULL);
+		}
+
+		AddOutputControl(XRT_OUTPUT_NAME_TOUCH_HAPTIC, "/output/haptic");
+
+		const enum xrt_input_name ht = left ? XRT_INPUT_HT_CONFORMING_LEFT : XRT_INPUT_HT_CONFORMING_RIGHT;
+		if (m_xdev->supported.hand_tracking && HasInput(ht)) {
+			// Finger curl estimated from the controls (not finger tracking): "Partial" tracking level.
+			AddSkeletonControl(left ? "/input/skeleton/left" : "/input/skeleton/right",
+			                   left ? "/skeleton/hand/left" : "/skeleton/hand/right", ht,
+			                   vr::VRSkeletalTracking_Partial);
+		} else {
+			ovrd_log("%s: no controller hand model (PIMAX_CTRL_HANDS off), no skeleton\n", m_xdev->str);
+		}
+	}
+
+	void
+	AddThresholdBool(const char *steamvr_control_path, enum xrt_input_name monado_input_name, float threshold)
+	{
+		SteamVRDriverControlInput in;
+		in.monado_input_type = XRT_INPUT_TYPE_BOOLEAN;
+		in.steamvr_control_path = steamvr_control_path;
+		in.monado_input_name = monado_input_name;
+		in.component.has_component = false;
+		in.bool_threshold = threshold;
+		vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, steamvr_control_path,
+		                                            &in.control_handle);
+		m_input_controls.push_back(in);
+		ovrd_log("Added input %s (value > %.2f)\n", steamvr_control_path, threshold);
+	}
+
 	static struct profile_template *
 	get_profile_template(enum xrt_device_name device_name)
 	{
@@ -882,7 +1009,10 @@ public:
 		m_pose.result = vr::TrackingResult_Uninitialized;
 		m_pose.willDriftInYaw = !m_xdev->supported.position_tracking;
 
-		if (m_emulate_index_controller) {
+		if (m_pimax_touch && !m_emulate_index_controller) {
+			m_input_profile = std::string("{oculus}/input/touch_profile.json");
+			m_controller_type = "oculus_touch";
+		} else if (m_emulate_index_controller) {
 			m_input_profile = std::string("{indexcontroller}/input/index_controller_profile.json");
 			m_controller_type = "knuckles";
 			if (m_hand == XRT_HAND_LEFT) {
@@ -908,11 +1038,23 @@ public:
 		vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_InputProfilePath_String, m_input_profile.c_str());
 		vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_RenderModelName_String, m_render_model);
 		vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_ModelNumber_String, m_xdev->str);
+		if (m_controller_type != NULL) {
+			vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_ControllerType_String, m_controller_type);
+		}
+		if (m_pimax_touch) {
+			vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_ManufacturerName_String, "Pimax");
+			vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_SerialNumber_String, m_sSerialNumber);
+		}
+		if (m_xdev->supported.battery_status) {
+			vr::VRProperties()->SetBoolProperty(m_ulPropertyContainer, vr::Prop_DeviceProvidesBatteryStatus_Bool, true);
+		}
 
 		// clang-format on
 
 		m_input_controls.clear();
-		if (m_emulate_index_controller) {
+		if (m_pimax_touch && !m_emulate_index_controller) {
+			AddPimaxTouchControls();
+		} else if (m_emulate_index_controller) {
 			AddEmulatedIndexControls();
 		} else {
 			AddMonadoControls();
@@ -1020,6 +1162,14 @@ public:
 		m_pose.vecDriverFromHeadTranslation[0] = 0.f;
 		m_pose.vecDriverFromHeadTranslation[1] = 0.f;
 		m_pose.vecDriverFromHeadTranslation[2] = 0.f;
+		if (m_pimax_touch && !m_emulate_index_controller) {
+			// Monado gives the OpenXR grip pose; an oculus_touch device pose is the Touch "raw" pose, and SteamVR
+			// derives /pose/openxr_grip (and tip, handgrip, ...) from it with the render model's components.
+			// raw = grip * inverse(openxr_grip component), so games that hold objects at the Touch raw pose and
+			// OpenXR apps on SteamVR both see the hand where it is.
+			copy_quat(&m_raw_from_grip.orientation, &m_pose.qDriverFromHeadRotation);
+			copy_vec3(&m_raw_from_grip.position, m_pose.vecDriverFromHeadTranslation);
+		}
 
 		return m_pose;
 	}
@@ -1028,6 +1178,23 @@ public:
 	RunFrame()
 	{
 		m_xdev->update_inputs(m_xdev);
+
+		// Battery, once a second (the dashboard shows it per controller).
+		if (m_xdev->supported.battery_status && m_unObjectId != vr::k_unTrackedDeviceIndexInvalid) {
+			const timepoint_ns now = os_monotonic_get_ns();
+			if (now - m_last_battery_ns > 1000000000LL) {
+				m_last_battery_ns = now;
+				bool present = false, charging = false;
+				float charge = 0.f;
+				if (xrt_device_get_battery_status(m_xdev, &present, &charging, &charge) == XRT_SUCCESS &&
+				    present) {
+					vr::VRProperties()->SetFloatProperty(m_ulPropertyContainer,
+					                                     vr::Prop_DeviceBatteryPercentage_Float, charge);
+					vr::VRProperties()->SetBoolProperty(m_ulPropertyContainer,
+					                                    vr::Prop_DeviceIsCharging_Bool, charging);
+				}
+			}
+		}
 
 
 		for (const auto &in : m_input_controls) {
@@ -1051,6 +1218,11 @@ public:
 			}
 
 			vr::VRInputComponentHandle_t handle = in.control_handle;
+
+			if (in.bool_threshold >= 0.f) {
+				vr::VRDriverInput()->UpdateBooleanComponent(handle, input->value.vec1.x > in.bool_threshold, 0);
+				continue;
+			}
 
 			if (in.monado_input_type == XRT_INPUT_TYPE_BOOLEAN) {
 				bool state = input->value.boolean;
@@ -1108,6 +1280,9 @@ public:
 			const timepoint_ns now_ns = os_monotonic_get_ns();
 
 			for (size_t i = 0; i < ht_input_names.size(); ++i) {
+				if (!HasInput(ht_input_names[i])) {
+					continue; // e.g. Pimax controllers only have the conforming (controller-shaped) hand
+				}
 				int64_t out_timestamp_ns;
 				struct xrt_hand_joint_set joint_set_value = {};
 				if (m_xdev->get_hand_tracking(m_xdev, ht_input_names[i], now_ns, &joint_set_value,
@@ -1172,6 +1347,12 @@ public:
 	vr::PropertyContainerHandle_t m_ulPropertyContainer;
 
 	bool m_emulate_index_controller = false;
+
+	//! Pimax Dream Air controller presented as Oculus Touch (AddPimaxTouchControls).
+	bool m_pimax_touch = false;
+	//! Touch raw pose from the OpenXR grip pose: inverse of the Quest 2 render model's openxr_grip component.
+	struct xrt_pose m_raw_from_grip = XRT_POSE_IDENTITY;
+	timepoint_ns m_last_battery_ns = 0;
 
 	std::vector<struct SteamVRDriverControlInput> m_input_controls;
 	//! Zeroed: control_handle 0 = k_ulInvalidInputComponentHandle until AddSkeletonControl created one. Before, a
@@ -1277,6 +1458,7 @@ private:
 
 	struct xrt_fov m_fovs[2];
 	struct xrt_pose m_view_pose[2];
+	bool m_logged_head_model = false;
 
 	bool m_poseUpdating = true;
 	std::thread *m_poseUpdateThread = NULL;
@@ -1437,6 +1619,15 @@ CDeviceDriver_Monado::GetPose()
 	m_relation_chain_push_pose_if_not_identity(&chain, offset);
 	m_relation_chain_resolve(&chain, &rel);
 
+	const bool positional = m_xdev->supported.position_tracking ||
+	                        (strstr(m_xdev->str, "Pimax") != NULL && debug_get_bool_option_pimax_slam_head());
+	if (!m_logged_head_model) {
+		m_logged_head_model = true;
+		ovrd_log("HMD %s: %s\n", m_xdev->str,
+		         positional ? "6DoF (position tracked), SteamVR head model OFF"
+		                    : "3DoF, SteamVR head model (neck) ON");
+	}
+
 	vr::DriverPose_t t = {
 	    // monado predicts pose "now", see xrt_device_get_tracked_pose
 	    .poseTimeOffset = 0,
@@ -1457,9 +1648,11 @@ CDeviceDriver_Monado::GetPose()
 
 	    .result = vr::TrackingResult_Running_OK,
 	    .poseIsValid = (rel.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) != 0,
-	    .willDriftInYaw = !m_xdev->supported.position_tracking,
-	    //! @todo: Monado head model?
-	    .shouldApplyHeadModel = !m_xdev->supported.position_tracking,
+	    .willDriftInYaw = !positional,
+	    // SteamVR's neck model adds a head translation from the rotation. With 6DoF the tracker already measures
+	    // that motion, so applying it doubled every head movement ("the head moves a bit too much"). Decided once
+	    // per session (no jump when the tracker drops out for a moment: the position is then held).
+	    .shouldApplyHeadModel = !positional,
 	    .deviceIsConnected = true,
 	};
 	apply_pose(&rel, &t);
