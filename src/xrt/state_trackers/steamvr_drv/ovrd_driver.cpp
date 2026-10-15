@@ -764,6 +764,20 @@ public:
 		enum xrt_input_name monado_input_name = b->input;
 		const char *steamvr_path = b->steamvr_path;
 
+		// PIMAX_STEAMVR_ENV: the profile template lists the inputs of both hands and of every controller variant;
+		// register only what this device has, or RunFrame logs "not found" for each of them at 1 kHz.
+		bool present = false;
+		for (uint32_t ii = 0; ii < m_xdev->input_count; ii++) {
+			if (m_xdev->inputs[ii].name == monado_input_name) {
+				present = true;
+				break;
+			}
+		}
+		if (!present) {
+			ovrd_log("%s: no input for %s, not registered\n", m_xdev->str, steamvr_path);
+			return;
+		}
+
 		enum xrt_input_type monado_input_type = XRT_GET_INPUT_TYPE(monado_input_name);
 
 		switch (monado_input_type) {
@@ -1070,7 +1084,8 @@ public:
 			}
 		}
 
-		if (m_xdev->supported.hand_tracking && m_skeletal_input_control.control_handle) {
+		if (m_xdev->supported.hand_tracking &&
+		    m_skeletal_input_control.control_handle != vr::k_ulInvalidInputComponentHandle) {
 			constexpr const std::size_t sk_comp_size = 2;
 
 			using ht_input_name_list = std::array<const enum xrt_input_name, sk_comp_size>;
@@ -1159,7 +1174,9 @@ public:
 	bool m_emulate_index_controller = false;
 
 	std::vector<struct SteamVRDriverControlInput> m_input_controls;
-	struct SteamVRDriverControlInput m_skeletal_input_control;
+	//! Zeroed: control_handle 0 = k_ulInvalidInputComponentHandle until AddSkeletonControl created one. Before, a
+	//! garbage handle made RunFrame call UpdateSkeletonComponent ("Invalid handle") and get_hand_tracking at 1 kHz.
+	struct SteamVRDriverControlInput m_skeletal_input_control = {};
 
 	std::vector<struct SteamVRDriverControlOutput> m_output_controls;
 
