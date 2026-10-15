@@ -8,6 +8,10 @@
  *
  * Usage: pimax_ht_bench SRC.pxcam|EUROC/mav0 [--cams A,B] [--orient auto|O0,O1] [--skip N] [--max N] [--every K]
  *                       [--calib XML] [--tsv OUT.tsv] [--nice N] [--dump DIR [--dump-every K]]
+ *                       [--kind tracking|led|any]
+ *
+ * --kind picks the .pxcam frames fed to Mercury: tracking (default, what the driver feeds), led (the short
+ * controller-LED exposure, for comparison only) or any (both, alternating as the camera delivers them).
  *
  * Example: nice -n 19 pimax_ht_bench ~/ctrl-test.pxcam --tsv /tmp/ht.tsv
  *
@@ -127,7 +131,7 @@ main(int argc, char **argv)
 	if (argc < 2 || argv[1][0] == '-') {
 		fprintf(stderr,
 		        "usage: %s SRC.pxcam [--cams A,B] [--orient auto|O0,O1] [--skip N] [--max N] [--every K] "
-		        "[--calib XML] [--tsv OUT] [--nice N]\n",
+		        "[--calib XML] [--tsv OUT] [--nice N] [--dump DIR [--dump-every K]] [--kind tracking|led|any]\n",
 		        argv[0]);
 		return 2;
 	}
@@ -138,6 +142,7 @@ main(int argc, char **argv)
 	int nice_v = 0;
 	const char *calib_path = NULL, *tsv_path = NULL, *dump_dir = NULL;
 	long dump_every = 25;
+	int want_kind = PIMAX_CAM_KIND_TRACKING; // -1 = any
 	for (int i = 2; i < argc; i++) {
 		const char *a = argv[i];
 		const char *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -165,6 +170,17 @@ main(int argc, char **argv)
 			dump_dir = v;
 		} else if (strcmp(a, "--dump-every") == 0) {
 			dump_every = atol(v) < 1 ? 1 : atol(v);
+		} else if (strcmp(a, "--kind") == 0) {
+			if (strcmp(v, "tracking") == 0) {
+				want_kind = PIMAX_CAM_KIND_TRACKING;
+			} else if (strcmp(v, "led") == 0) {
+				want_kind = PIMAX_CAM_KIND_LED;
+			} else if (strcmp(v, "any") == 0) {
+				want_kind = -1;
+			} else {
+				fprintf(stderr, "--kind: tracking, led or any\n");
+				return 2;
+			}
 		} else if (strcmp(a, "--nice") == 0) {
 			nice_v = atoi(v);
 		} else {
@@ -251,7 +267,7 @@ main(int argc, char **argv)
 			if (r <= 0) {
 				break;
 			}
-			if (fi.kind != PIMAX_CAM_KIND_TRACKING) {
+			if (want_kind >= 0 && (int)fi.kind != want_kind) {
 				continue;
 			}
 		} else if (eu.next >= eu.count) {
@@ -359,7 +375,8 @@ main(int argc, char **argv)
 	qsort(cpu, n, sizeof(double), cmp_d);
 	qsort(dist, ndist, sizeof(double), cmp_d);
 	printf("model load %.0f ms\n", t_create * 1000.0);
-	printf("pairs %zu (tracking frames seen %" PRIu64 ", skip %ld, every %ld), dark pairs %" PRIu64 "\n", n,
+	printf("pairs %zu (%s frames seen %" PRIu64 ", skip %ld, every %ld), dark pairs %" PRIu64 "\n", n,
+	       want_kind == PIMAX_CAM_KIND_TRACKING ? "tracking" : want_kind == PIMAX_CAM_KIND_LED ? "LED" : "all",
 	       tracking_idx, skip, every, dark);
 	printf("wall ms per pair: mean %.2f p50 %.2f p95 %.2f p99 %.2f max %.2f\n", mean_w, pct(wall, n, 0.5),
 	       pct(wall, n, 0.95), pct(wall, n, 0.99), n ? wall[n - 1] : NAN);
