@@ -65,6 +65,14 @@ set_target_properties(driver_monado PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${PLUGI
 # don't add lib prefix to driver_monado.so
 set_target_properties(driver_monado PROPERTIES PREFIX "")
 
+# PIMAX_RTTIME_PRELOAD: LD_PRELOAD for SteamVR started on the host (see pimax_rttime_preload.c)
+if(NOT WIN32 AND NOT APPLE AND NOT ANDROID)
+	add_library(pimax_rttime_preload MODULE pimax_rttime_preload.c)
+	target_link_libraries(pimax_rttime_preload PRIVATE ${CMAKE_DL_LIBS})
+	set_target_properties(pimax_rttime_preload PROPERTIES PREFIX "" LIBRARY_OUTPUT_DIRECTORY "${PLUGINDIR}")
+	add_dependencies(driver_monado pimax_rttime_preload)
+endif()
+
 install(
 	DIRECTORY "${PROJECT_BINARY_DIR}/steamvr-monado"
 	DESTINATION "${CMAKE_INSTALL_PREFIX}/share"
