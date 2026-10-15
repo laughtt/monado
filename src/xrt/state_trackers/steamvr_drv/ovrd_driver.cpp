@@ -1454,6 +1454,32 @@ private:
 
 	float m_flSecondsFromVsyncToPhotons = -1;
 	float m_flDisplayFrequency = -1;
+
+public:
+	/*!
+	 * vrcompositor overwrites Prop_DisplayFrequency_Float with its own idea (90 Hz) right after it starts, although
+	 * it selected the panel's 72 Hz mode and the panel was woken at PIMAX_FPS; games read that property for frame
+	 * pacing and reprojection timing. Put the device's rate back whenever it differs (checked from RunFrame).
+	 */
+	void
+	ReassertDisplayFrequency()
+	{
+		if (m_ulPropertyContainer == vr::k_ulInvalidPropertyContainer || m_flDisplayFrequency <= 0) {
+			return;
+		}
+		vr::ETrackedPropertyError err = vr::TrackedProp_Success;
+		float now = vr::VRProperties()->GetFloatProperty(m_ulPropertyContainer, vr::Prop_DisplayFrequency_Float, &err);
+		if (err != vr::TrackedProp_Success || fabsf(now - m_flDisplayFrequency) < 0.5f) {
+			return;
+		}
+		vr::VRProperties()->SetFloatProperty(m_ulPropertyContainer, vr::Prop_DisplayFrequency_Float, m_flDisplayFrequency);
+		if (m_displayFrequencyResets++ < 5) {
+			ovrd_log("Display frequency was changed to %f by SteamVR, set back to the device's %f Hz\n", now, m_flDisplayFrequency);
+		}
+	}
+
+private:
+	int m_displayFrequencyResets = 0;
 	float m_flIPD = -1;
 
 	struct xrt_fov m_fovs[2];
@@ -1979,6 +2005,9 @@ CServerDriver_Monado::HandleHapticEvent(vr::VREvent_t *event)
 void
 CServerDriver_Monado::RunFrame()
 {
+	if (m_MonadoDeviceDriver) {
+		m_MonadoDeviceDriver->ReassertDisplayFrequency();
+	}
 	if (m_left) {
 		m_left->RunFrame();
 	}
