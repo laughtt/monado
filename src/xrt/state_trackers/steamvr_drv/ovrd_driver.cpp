@@ -13,6 +13,8 @@
  */
 
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <cassert>
 #include <array>
 #include <thread>
@@ -54,6 +56,58 @@ extern "C" {
 DEBUG_GET_ONCE_BOOL_OPTION(emulate_index_controller, "STEAMVR_EMULATE_INDEX_CONTROLLER", false)
 
 DEBUG_GET_ONCE_NUM_OPTION(scale_percentage, "XRT_COMPOSITOR_SCALE_PERCENTAGE", 140)
+
+/*!
+ * PIMAX_STEAMVR_ENV: vrserver does not get the environment `pimax vr start` gives monado-service, so the driver reads
+ * the same Pimax settings from $PIMAX_STEAMVR_ENV_FILE, else ~/.config/pimax/steamvr-driver.env (KEY=VALUE lines,
+ * written by `pimax vr start` with "Games run with: SteamVR"). Must run before anything calls debug_get_*.
+ */
+static void
+pimax_steamvr_load_env(void)
+{
+	char path[1024];
+	const char *file = getenv("PIMAX_STEAMVR_ENV_FILE");
+	if (file != NULL && file[0] != '\0') {
+		snprintf(path, sizeof(path), "%s", file);
+	} else {
+		const char *home = getenv("HOME");
+		snprintf(path, sizeof(path), "%s/.config/pimax/steamvr-driver.env", home != NULL ? home : "");
+	}
+	FILE *f = fopen(path, "r");
+	if (f == NULL) {
+		ovrd_log("PIMAX_STEAMVR_ENV: no %s, using the environment as it is\n", path);
+		return;
+	}
+	char line[2048];
+	int n = 0;
+	while (fgets(line, sizeof(line), f) != NULL) {
+		line[strcspn(line, "\r\n")] = '\0';
+		char *eq = strchr(line, '=');
+		if (line[0] == '#' || eq == NULL || eq == line) {
+			continue;
+		}
+		*eq = '\0';
+		if (setenv(line, eq + 1, 1) == 0) {
+			n++;
+		}
+	}
+	fclose(f);
+	ovrd_log("PIMAX_STEAMVR_ENV: %d settings from %s\n", n, path);
+}
+
+//! The user's IPD in metres from OXR_DEBUG_IPD_MM (the Pimax app's IPD), else 63 mm.
+static float
+pimax_ipd_meters(void)
+{
+	const char *mm = getenv("OXR_DEBUG_IPD_MM");
+	if (mm != NULL) {
+		float v = strtof(mm, NULL);
+		if (v >= 50.f && v <= 80.f) {
+			return v / 1000.f;
+		}
+	}
+	return 0.063f;
+}
 
 #define MODELNUM_LEN (XRT_DEVICE_NAME_LEN + 9) // "[Monado] "
 
@@ -1150,7 +1204,7 @@ public:
 		}
 
 		//! @todo get ipd user setting from monado session
-		float ipd_meters = 0.063f;
+		float ipd_meters = pimax_ipd_meters();
 		struct xrt_vec3 ipd_vec = {ipd_meters, 0, 0};
 
 		timepoint_ns now_ns = os_monotonic_get_ns();
@@ -1270,6 +1324,19 @@ CDeviceDriver_Monado::Activate(vr::TrackedDeviceIndex_t unObjectId)
 
 	// return a constant that's not 0 (invalid) or 1 (reserved for Oculus)
 	vr::VRProperties()->SetUint64Property( m_ulPropertyContainer, vr::Prop_CurrentUniverseId_Uint64, 2);
+
+	// Pimax Dream Air: let vrcompositor find the panel for direct mode by its EDID ("PVR" 0xD242 / 0x1019, the
+	// byte order of SteamVR's direct_mode list) and keep the one rate the driver prepared the panel for (PIMAX_FPS):
+	// at another rate the firmware never lights the panel.
+	if (strstr(m_xdev->str, "Pimax") != NULL) {
+		vr::VRProperties()->SetInt32Property(m_ulPropertyContainer, vr::Prop_EdidVendorID_Int32, 0xD242);
+		vr::VRProperties()->SetInt32Property(m_ulPropertyContainer, vr::Prop_EdidProductID_Int32, 0x1019);
+		vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_ManufacturerName_String, "Pimax");
+		float rates[1] = {m_flDisplayFrequency};
+		vr::VRProperties()->SetProperty(m_ulPropertyContainer, vr::Prop_DisplayAvailableFrameRates_Float_Array, rates, sizeof(rates), vr::k_unFloatPropertyTag);
+		vr::VRProperties()->SetBoolProperty(m_ulPropertyContainer, vr::Prop_DisplaySupportsRuntimeFramerateChange_Bool, false);
+		ovrd_log("PIMAX_STEAMVR_ENV: Pimax EDID 0xD242/0x1019 and %.0f Hz set for direct mode\n", m_flDisplayFrequency);
+	}
 
 	// avoid "not fullscreen" warnings from vrmonitor
 	//vr::VRProperties()->SetBoolProperty(m_ulPropertyContainer, vr::Prop_IsOnDesktop_Bool, false);
@@ -1431,8 +1498,15 @@ CDeviceDriver_Monado::GetRecommendedRenderTargetSize(uint32_t *pnWidth, uint32_t
 
 
 
-	*pnWidth = m_xdev->hmd->screens[0].w_pixels * fscale;
-	*pnHeight = m_xdev->hmd->screens[0].h_pixels * fscale;
+	// per eye, as SteamVR expects (screens[0] is the whole panel of both eyes)
+	uint32_t w = m_xdev->hmd->views[0].display.w_pixels;
+	uint32_t h = m_xdev->hmd->views[0].display.h_pixels;
+	if (w == 0 || h == 0) {
+		w = m_xdev->hmd->screens[0].w_pixels;
+		h = m_xdev->hmd->screens[0].h_pixels;
+	}
+	*pnWidth = w * fscale;
+	*pnHeight = h * fscale;
 
 	ovrd_log("Render Target Size: %dx%d (%fx)\n", *pnWidth, *pnHeight, fscale);
 }
@@ -1563,6 +1637,7 @@ CServerDriver_Monado::Init(vr::IVRDriverContext *pDriverContext)
 	ovrd_log_init(vr::VRDriverLog());
 
 	ovrd_log("Initializing Monado driver\n");
+	pimax_steamvr_load_env();
 
 	//! @todo instance initialization is difficult to replicate
 
@@ -1635,8 +1710,12 @@ CServerDriver_Monado::Cleanup()
 	xrt_system_devices_destroy(&m_xsysd);
 	xrt_system_destroy(&m_xsys);
 	m_xhmd = NULL;
-	m_left->m_xdev = NULL;
-	m_right->m_xdev = NULL;
+	if (m_left != NULL) {
+		m_left->m_xdev = NULL;
+	}
+	if (m_right != NULL) {
+		m_right->m_xdev = NULL;
+	}
 
 	if (m_xinst) {
 		xrt_instance_destroy(&m_xinst);
