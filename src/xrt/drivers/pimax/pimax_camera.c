@@ -379,6 +379,35 @@ update_stats(struct pimax_camera *pc, int64_t now)
 			              ti.corr_rot[2] * ti.corr_rot[2]) * 57.2958,
 			         ti.max_corr_pos * 1000.0, ti.max_corr_rot * 57.2958, ti.blended, ti.snapped);
 		}
+		// Every output correction step of >= 20 mm (PIMAX_SLAM_BIG_CORR_MM) since the last stats: when, which
+		// axis, how fast the head moved (corrections hide in motion; at rest they show as sliding).
+		int logged = 0, more = 0;
+		for (;;) {
+			pimax_cam_track_corr c;
+			os_mutex_lock(&pc->slam_lock);
+			int got = pimax_cam_track_take_big_corr(pc->track, &c);
+			os_mutex_unlock(&pc->slam_lock);
+			if (got != 1) {
+				break;
+			}
+			if (logged >= 8) {
+				more++;
+				continue;
+			}
+			logged++;
+			double h = sqrt(c.step[0] * c.step[0] + c.step[2] * c.step[2]);
+			double v = fabs(c.step[1]);
+			double off = sqrt(c.offset[0] * c.offset[0] + c.offset[1] * c.offset[1] + c.offset[2] * c.offset[2]);
+			CAM_INFO(pc,
+			         "6DoF correction: %.0f mm (%s: vertical %.0f, horizontal %.0f), pending %.0f mm / %.2f deg, "
+			         "head %.2f m/s %.0f deg/s, %s, t %.3f s",
+			         sqrt(h * h + v * v) * 1000.0, v > h ? "vertical" : "horizontal", c.step[1] * 1000.0,
+			         h * 1000.0, off * 1000.0, c.rot * 57.2958, c.speed, c.ang_speed * 57.2958,
+			         c.pose_only ? "tracker pose" : "supervisor", (double)c.ts_ns / 1e9);
+		}
+		if (more > 0) {
+			CAM_INFO(pc, "6DoF correction: %d more >= 20 mm not shown", more);
+		}
 	}
 #ifdef XRT_BUILD_DRIVER_HANDTRACKING
 	pimax_ht_log_stats(pc->ht);
