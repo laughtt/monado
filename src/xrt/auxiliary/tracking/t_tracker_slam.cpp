@@ -1284,6 +1284,8 @@ receive_frame(TrackerSlam &t, struct xrt_frame *frame, uint32_t cam_index)
 	if (last_ts >= ts) {
 		SLAM_WARN("Frame (%" PRId64 ") is older than last (%" PRId64 ") by %" PRId64 " ns", ts, last_ts,
 		          last_ts - ts);
+		// Basalt asserts on a zero/negative frame delta (sqrt_keypoint_vio.cpp:307), drop the frame like the IMU path does
+		return;
 	}
 	last_ts = ts;
 
