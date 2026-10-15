@@ -577,6 +577,23 @@ client_vk_compositor_destroy(struct xrt_compositor *xc)
 	struct vk_bundle *vk = &c->vk;
 
 	if (c->sync.semaphore != VK_NULL_HANDLE) {
+#ifdef VK_KHR_timeline_semaphore
+		// The last frame's queue submission may still be about to signal this semaphore: destroying it (and the
+		// shared payload behind it) first lets the GPU write into freed memory (Xid 31 MMU fault, VIRT_WRITE, seen
+		// at WayVR exit). Wait for the last value, bounded so a lost device cannot hang the app's exit.
+		if (c->sync.value > 0 && vk->vkWaitSemaphores != NULL) {
+			VkSemaphoreWaitInfo wait_info = {
+			    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+			    .semaphoreCount = 1,
+			    .pSemaphores = &c->sync.semaphore,
+			    .pValues = &c->sync.value,
+			};
+			VkResult wret = vk->vkWaitSemaphores(vk->device, &wait_info, 1000ull * 1000ull * 1000ull);
+			if (wret != VK_SUCCESS) {
+				VK_WARN(vk, "client destroy: timeline semaphore wait: %s", vk_result_string(wret));
+			}
+		}
+#endif
 		vk->vkDestroySemaphore(vk->device, c->sync.semaphore, NULL);
 		c->sync.semaphore = VK_NULL_HANDLE;
 	}
