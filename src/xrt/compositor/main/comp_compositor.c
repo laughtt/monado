@@ -66,6 +66,7 @@
 
 #include "util/comp_vulkan.h"
 #include "main/comp_compositor.h"
+#include "main/comp_recorder.h"
 #include "main/comp_frame.h"
 
 #ifdef XRT_FEATURE_WINDOW_PEEK
@@ -320,6 +321,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	bool fast_path =                              //
 	    !c->peek &&                               //
 	    !c->mirroring_to_debug_gui &&             //
+	    !comp_recorder_wants_layer_squash() &&    // pimax: the recorder reads the squashed eye images
 	    !c->debug.disable_fast_path &&            //
 	    can_do_one_projection_layer_fast_path(c); //
 	c->base.frame_params.one_projection_layer_fast_path = fast_path;

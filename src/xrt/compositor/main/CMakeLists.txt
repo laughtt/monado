@@ -23,6 +23,9 @@ add_library(
 	comp_window_debug_image.c
 	comp_mirror_to_debug_gui.c
 	comp_mirror_to_debug_gui.h
+	comp_recorder.c
+	comp_recorder.h
+	comp_recorder_shm.h
 	)
 target_link_libraries(
 	comp_main

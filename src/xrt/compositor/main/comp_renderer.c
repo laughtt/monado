@@ -38,6 +38,7 @@
 
 #include "main/comp_frame.h"
 #include "main/comp_mirror_to_debug_gui.h"
+#include "main/comp_recorder.h"
 
 #ifdef XRT_FEATURE_WINDOW_PEEK
 #include "main/comp_window_peek.h"
@@ -148,6 +149,9 @@ struct comp_renderer
 	struct comp_settings *settings;
 
 	struct comp_mirror_to_debug_gui mirror_to_debug_gui;
+
+	//! pimax: recorder tap (NULL when PIMAX_RECORD=0), see comp_recorder.h.
+	struct comp_recorder *recorder;
 
 	//! @}
 
@@ -894,6 +898,8 @@ renderer_init(struct comp_renderer *r, struct comp_compositor *c, VkExtent2D scr
 		COMP_ERROR(c, "comp_mirror_init: %s", vk_result_string(ret));
 		assert(false && "Whelp, can't return a error. But should never really fail.");
 	}
+
+	r->recorder = comp_recorder_create(c);
 }
 
 static void
@@ -1174,6 +1180,9 @@ renderer_fini(struct comp_renderer *r)
 	renderer_close_renderings_and_fences(r);
 
 	// Do before layer render just in case it holds any references.
+	// pimax: the recorder's worker waits (bounded) for its readbacks before the scratch images go away.
+	comp_recorder_destroy(&r->recorder);
+
 	comp_mirror_fini(&r->mirror_to_debug_gui, vk);
 
 	// Do this after the layer renderer.
@@ -1660,6 +1669,11 @@ comp_renderer_draw(struct comp_renderer *r)
 	 * This is done after a swap so isn't time critical.
 	 */
 	bool queue_idle = renderer_wait_queue_idle(r);
+
+	// pimax: hand the squashed eye images to the recorder (never waits; drops the frame if it cannot keep up).
+	if (queue_idle && r->recorder != NULL) {
+		comp_recorder_capture(r->recorder, &frame_state.scratch_state, frame_id, predicted_display_time_ns);
+	}
 
 	/*
 	 * Free any resources and finalize the scratch images,
