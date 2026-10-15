@@ -47,10 +47,14 @@ pimax_create_auto_prober(void);
 struct xrt_device *
 pimax_hmd_create(struct xrt_device *out_ctrls[2]);
 
-/*! Mercury hand-tracking device of the HMD's camera pipeline (PIMAX_HANDS=mercury), or NULL. Call once; the caller
- * (the system) owns it afterwards. */
-struct xrt_device *
-pimax_hmd_take_hand_tracker(struct xrt_device *hmd);
+/*! Left and right camera hand devices (PIMAX_HANDS=mercury), NULL each if none. Call once; the system owns them. */
+void
+pimax_hmd_take_hand_devices(struct xrt_device *hmd, struct xrt_device *out[2]);
+
+/*! Head relation at a (usually past) time, as get_tracked_pose reports it, without recording it for the room
+ * anchor. Thread-safe; used by the camera hands to place a hand seen at the frame time in the world. */
+void
+pimax_hmd_head_relation_at(struct xrt_device *hmd, int64_t at_timestamp_ns, struct xrt_space_relation *out_relation);
 
 #ifdef __cplusplus
 }

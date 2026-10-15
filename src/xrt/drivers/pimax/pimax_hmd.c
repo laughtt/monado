@@ -232,10 +232,10 @@ pimax_hmd_clock_ref(void *user, struct pimax_camera_clock_ref *out)
 	return out->valid != 0;
 }
 
-struct xrt_device *
-pimax_hmd_take_hand_tracker(struct xrt_device *xdev)
+void
+pimax_hmd_take_hand_devices(struct xrt_device *xdev, struct xrt_device *out[2])
 {
-	return pimax_camera_take_hand_device(pimax_hmd(xdev)->camera);
+	pimax_camera_take_hand_devices(pimax_hmd(xdev)->camera, out);
 }
 
 static void
@@ -572,19 +572,14 @@ pimax_hmd_update_inputs(struct xrt_device *xdev)
 	return XRT_SUCCESS;
 }
 
-static xrt_result_t
-pimax_hmd_get_tracked_pose(struct xrt_device *xdev,
-                           enum xrt_input_name name,
-                           int64_t at_timestamp_ns,
-                           struct xrt_space_relation *out_relation)
+//! Head relation at @p at_timestamp_ns (3DoF/6DoF, HID loss, room anchor). @p record_anchor: false for past-time
+//! queries from the camera hands, so the anchor's pose ring only sees the compositor's queries.
+static void
+pimax_hmd_head_relation(struct pimax_hmd *hmd,
+                        int64_t at_timestamp_ns,
+                        bool record_anchor,
+                        struct xrt_space_relation *out_relation)
 {
-	struct pimax_hmd *hmd = pimax_hmd(xdev);
-
-	if (name != XRT_INPUT_GENERIC_HEAD_POSE && !(name == XRT_INPUT_GENERIC_EYE_GAZE_POSE && hmd->eye != NULL)) {
-		U_LOG_XDEV_UNSUPPORTED_INPUT(&hmd->base, hmd->log_level, name);
-		return XRT_ERROR_INPUT_UNSUPPORTED;
-	}
-
 	struct xrt_space_relation relation = XRT_SPACE_RELATION_ZERO;
 	const bool hid_lost = hmd->lib != NULL && hmd->hid_ever_connected && !atomic_load(&hmd->hid_connected);
 	if (hid_lost) {
@@ -617,7 +612,31 @@ pimax_hmd_get_tracked_pose(struct xrt_device *xdev,
 	}
 
 	// Room anchor (PIMAX_ANCHOR=1): record the raw SLAM pose, then move the world by the offset from `pimax-anchor apply`.
-	pimax_anchor_process(at_timestamp_ns, &relation);
+	pimax_anchor_process_ex(at_timestamp_ns, &relation, record_anchor);
+	*out_relation = relation;
+}
+
+void
+pimax_hmd_head_relation_at(struct xrt_device *xdev, int64_t at_timestamp_ns, struct xrt_space_relation *out_relation)
+{
+	pimax_hmd_head_relation(pimax_hmd(xdev), at_timestamp_ns, false, out_relation);
+}
+
+static xrt_result_t
+pimax_hmd_get_tracked_pose(struct xrt_device *xdev,
+                           enum xrt_input_name name,
+                           int64_t at_timestamp_ns,
+                           struct xrt_space_relation *out_relation)
+{
+	struct pimax_hmd *hmd = pimax_hmd(xdev);
+
+	if (name != XRT_INPUT_GENERIC_HEAD_POSE && !(name == XRT_INPUT_GENERIC_EYE_GAZE_POSE && hmd->eye != NULL)) {
+		U_LOG_XDEV_UNSUPPORTED_INPUT(&hmd->base, hmd->log_level, name);
+		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
+
+	struct xrt_space_relation relation;
+	pimax_hmd_head_relation(hmd, at_timestamp_ns, true, &relation);
 
 	if (name == XRT_INPUT_GENERIC_EYE_GAZE_POSE) {
 		// Gaze ray in head space (Rust session), composed with the head pose at the requested time.

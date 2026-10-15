@@ -9,6 +9,7 @@
 #include "util/u_debug.h"
 #include "util/u_logging.h"
 #include "util/u_misc.h"
+#include "xrt/xrt_device.h"
 #include "pimax_interface.h"
 
 #include <stdlib.h>
@@ -31,14 +32,29 @@ create_devices(struct xrt_device **out_xdev)
 	created = true;
 	out_xdev[0] = xdev;
 	int n = 1;
+	// Camera hands (PIMAX_HANDS=mercury). With PIMAX_HT_ROLES=hands they are left/right hand controllers and come
+	// before the Pimax controllers, so the role assignment (first of each type wins) gives them the hand roles.
+	struct xrt_device *hands[2] = {NULL, NULL};
+	pimax_hmd_take_hand_devices(xdev, hands);
+	bool hands_first = hands[0] != NULL && hands[0]->device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER;
+	if (hands_first) {
+		for (int i = 0; i < 2; i++) {
+			if (hands[i] != NULL) {
+				out_xdev[n++] = hands[i];
+			}
+		}
+	}
 	for (int i = 0; i < 2; i++) {
 		if (ctrls[i] != NULL) {
 			out_xdev[n++] = ctrls[i];
 		}
 	}
-	struct xrt_device *hands = pimax_hmd_take_hand_tracker(xdev);
-	if (hands != NULL) {
-		out_xdev[n++] = hands;
+	if (!hands_first) {
+		for (int i = 0; i < 2; i++) {
+			if (hands[i] != NULL) {
+				out_xdev[n++] = hands[i];
+			}
+		}
 	}
 	return n;
 }

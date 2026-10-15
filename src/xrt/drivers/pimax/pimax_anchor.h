@@ -252,10 +252,12 @@ pimax_anchor_step_locked(struct pimax_anchor_state *s, int64_t now_ns)
 }
 
 /*!
- * Record the raw relation (SLAM world) and apply the offset to it in place. Cheap when PIMAX_ANCHOR is not set.
+ * Record the raw relation (SLAM world, only when @p record) and apply the offset to it in place. Cheap when
+ * PIMAX_ANCHOR is not set. Queries for past times (the camera hands' head pose at the frame time) pass
+ * record = false so the anchor's pose ring only sees the compositor's own queries.
  */
 static inline void
-pimax_anchor_process(int64_t at_ns, struct xrt_space_relation *rel)
+pimax_anchor_process_ex(int64_t at_ns, struct xrt_space_relation *rel, bool record)
 {
 	struct pimax_anchor_state *s = &g_pimax_anchor;
 	pthread_mutex_lock(&s->lock);
@@ -266,7 +268,9 @@ pimax_anchor_process(int64_t at_ns, struct xrt_space_relation *rel)
 		pthread_mutex_unlock(&s->lock);
 		return;
 	}
-	pimax_anchor_record_locked(s, at_ns, rel);
+	if (record) {
+		pimax_anchor_record_locked(s, at_ns, rel);
+	}
 	int64_t now_ns = (int64_t)os_monotonic_get_ns();
 	pimax_anchor_refresh_offset_locked(s, now_ns);
 	bool have = s->have_offset;
@@ -297,4 +301,11 @@ pimax_anchor_process(int64_t at_ns, struct xrt_space_relation *rel)
 		math_quat_rotate_vec3(&off.orientation, &rel->angular_velocity, &v);
 		rel->angular_velocity = v;
 	}
+}
+
+//! Record the raw relation (SLAM world) and apply the offset to it in place (the compositor's head queries).
+static inline void
+pimax_anchor_process(int64_t at_ns, struct xrt_space_relation *rel)
+{
+	pimax_anchor_process_ex(at_ns, rel, true);
 }

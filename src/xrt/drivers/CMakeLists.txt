@@ -156,7 +156,15 @@ if(XRT_BUILD_DRIVER_PIMAX)
 					  aux_tracking drv_multi
 			)
 		if(XRT_BUILD_DRIVER_HANDTRACKING)
-			target_link_libraries(drv_pimax PRIVATE drv_ht)
+			target_sources(drv_pimax PRIVATE pimax/pimax_ht.c pimax/pimax_ht.h pimax/pimax_ht_calib.c pimax/pimax_ht_calib.h)
+			target_link_libraries(drv_pimax PRIVATE drv_ht t_ht_mercury)
+			# Offline Mercury bench on .pxcam recordings (no headset, no service): pimax_ht_bench SRC.pxcam
+			add_executable(pimax_ht_bench pimax/pimax_ht_bench.c pimax/pimax_ht_bench_png.cpp pimax/pimax_ht_calib.c)
+			target_include_directories(pimax_ht_bench PRIVATE ${PIMAX_CAM_DIR}/include)
+			target_link_libraries(
+				pimax_ht_bench PRIVATE xrt-interfaces aux_util aux_math aux_tracking t_ht_mercury ${OpenCV_LIBRARIES}
+						       ${PIMAX_RUST_TARGET_DIR}/libpimax_cam.a ${CMAKE_DL_LIBS} m rt util Threads::Threads
+				)
 		endif()
 	endif()
 	list(APPEND ENABLED_HEADSET_DRIVERS pimax)

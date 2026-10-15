@@ -7,11 +7,11 @@
  *
  * Graph (one capture thread):
  *   pimax-cam (V4L2 or .pxcam replay) -> tracking-exposure frames (25 Hz; LED frames only reach the debug sinks)
- *     view 0 / view 1 -> u_sink_split -> Mercury view sink (t_hand_tracking_async)
- *                                     -> SLAM placeholder sink (counts frames)
+ *     PIMAX_HT_CAMS tiles -> pimax_ht_push (camera hands, pimax_ht.c: own low-priority thread, newest pair only)
  *     PIMAX_SLAM_CAMS tiles (IMU-timed only) -> SLAM tracker (t_slam / VIT, Basalt) and/or EuRoC recorder
  *   HMD IMU thread -> pimax_camera_push_imu -> SLAM tracker IMU sink and/or EuRoC recorder
- *   Mercury device -> multi tracking override attached to the HMD head pose -> XR_EXT_hand_tracking.
+ *   camera hands -> world-locked with the head pose at the frame time (6DoF when SLAM tracks) -> two hand
+ *     devices: XR_EXT_hand_tracking joints + XR_EXT_hand_interaction (pinch, poke, aim, grasp).
  *   HMD get_tracked_pose -> pimax_camera_head_relation: tracker pose checked by the Rust supervisor
  *     (pimax_cam_track_*: acquire/lose/reset, continuity) or the 3DoF orientation at the held position.
  *
@@ -88,11 +88,11 @@ pimax_camera_head_relation(struct pimax_camera *pc,
 	return false;
 }
 
-struct xrt_device *
-pimax_camera_take_hand_device(struct pimax_camera *pc)
+void
+pimax_camera_take_hand_devices(struct pimax_camera *pc, struct xrt_device *out[2])
 {
 	(void)pc;
-	return NULL;
+	out[0] = out[1] = NULL;
 }
 
 void
@@ -125,8 +125,9 @@ pimax_camera_destroy(struct pimax_camera **pc_ptr)
 #include "tracking/t_euroc_recorder.h"
 
 #ifdef XRT_BUILD_DRIVER_HANDTRACKING
-#include "../ht/ht_interface.h"
-#include "../multi_wrapper/multi.h"
+#include "pimax_ht.h"
+#include "pimax_ht_calib.h"
+#include "pimax_interface.h"
 #endif
 
 #include "pimax_cam.h"
@@ -148,6 +149,12 @@ DEBUG_GET_ONCE_OPTION(pimax_ht_cams, "PIMAX_HT_CAMS", "0,1")
 DEBUG_GET_ONCE_OPTION(pimax_ht_orient, "PIMAX_HT_ORIENT", NULL)
 DEBUG_GET_ONCE_OPTION(pimax_ht_head_offset, "PIMAX_HT_HEAD_OFFSET", NULL)
 DEBUG_GET_ONCE_BOOL_OPTION(pimax_ht_stats, "PIMAX_HT_STATS", false)
+DEBUG_GET_ONCE_OPTION(pimax_ht_roles, "PIMAX_HT_ROLES", "tracking")
+DEBUG_GET_ONCE_NUM_OPTION(pimax_ht_nice, "PIMAX_HT_NICE", 10)
+DEBUG_GET_ONCE_FLOAT_OPTION(pimax_ht_hz, "PIMAX_HT_HZ", 25.0f)
+DEBUG_GET_ONCE_FLOAT_OPTION(pimax_ht_duty, "PIMAX_HT_DUTY", 0.5f)
+DEBUG_GET_ONCE_NUM_OPTION(pimax_ht_stale_ms, "PIMAX_HT_STALE_MS", 150)
+DEBUG_GET_ONCE_FLOAT_OPTION(pimax_ht_predict_ms, "PIMAX_HT_PREDICT_MS", 0.0f)
 DEBUG_GET_ONCE_BOOL_OPTION(pimax_slam, "PIMAX_SLAM", false)
 DEBUG_GET_ONCE_OPTION(pimax_slam_cams, "PIMAX_SLAM_CAMS", "0,1")
 DEBUG_GET_ONCE_OPTION(pimax_slam_record, "PIMAX_SLAM_RECORD", NULL)
@@ -189,16 +196,10 @@ struct pimax_camera
 	struct os_thread_helper thread;
 	bool thread_started;
 
-	//! Mercury.
+	//! Camera hands (pimax_ht.c).
 	bool hands;
 	uint32_t ht_cams[2];
-	struct t_stereo_camera_calibration *stereo;
-	struct xrt_device *ht_raw; //!< Mercury's device; owned by ht_dev after wrapping
-	struct xrt_device *ht_dev; //!< handed to the system
-	bool ht_taken;
-	struct xrt_frame_sink *entry[2]; //!< per view: split(Mercury, SLAM placeholder)
-	struct xrt_frame_sink slam_stub[2];
-	uint64_t slam_stub_frames[2];
+	struct pimax_ht *ht;
 	bool stats_ht;
 
 	//! Debug GUI: the four tiles of every frame.
@@ -206,13 +207,9 @@ struct pimax_camera
 
 	//! Stats (capture thread writes; u_var reads, races are harmless).
 	uint64_t frames, tracking_frames, pairs_pushed, imu_timed, errors, timeouts;
-	float fps, tracking_fps, mercury_fps;
+	float fps, tracking_fps;
 	int64_t win_start_ns;
-	uint64_t win_frames, win_tracking, win_ht_updates;
-	int64_t last_ht_ts;
-	//! Hand activity per stats window (PIMAX_HT_STATS=1): polls, active polls, last wrist in camera-0 space.
-	uint64_t win_polls, win_active[2];
-	struct xrt_vec3 last_wrist[2];
+	uint64_t win_frames, win_tracking;
 	int64_t last_frame_ts;
 
 	//! 6DoF (PIMAX_SLAM) and EuRoC recording (PIMAX_SLAM_RECORD).
@@ -254,22 +251,6 @@ struct pimax_camera
 	char ae_status[160];
 };
 
-static void
-slam_stub_push0(struct xrt_frame_sink *xfs, struct xrt_frame *xf)
-{
-	(void)xf;
-	struct pimax_camera *pc = container_of(xfs, struct pimax_camera, slam_stub[0]);
-	pc->slam_stub_frames[0]++;
-}
-
-static void
-slam_stub_push1(struct xrt_frame_sink *xfs, struct xrt_frame *xf)
-{
-	(void)xf;
-	struct pimax_camera *pc = container_of(xfs, struct pimax_camera, slam_stub[1]);
-	pc->slam_stub_frames[1]++;
-}
-
 static bool
 parse_u32_pair(const char *s, uint32_t out[2])
 {
@@ -279,119 +260,6 @@ parse_u32_pair(const char *s, uint32_t out[2])
 	}
 	out[0] = a;
 	out[1] = b;
-	return true;
-}
-
-static void
-mat9_to_quat(const double r[9], struct xrt_quat *out)
-{
-	struct xrt_matrix_3x3 m;
-	for (int i = 0; i < 9; i++) {
-		m.v[i] = (float)r[i];
-	}
-	math_quat_from_matrix_3x3(&m, out);
-	math_quat_normalize(out);
-}
-
-/*!
- * Mercury view orientation from the calibration: the image "down" axis of the camera in the body frame (y up).
- * Image down pointing up = camera mounted upside down = CAMERA_ORIENTATION_180.
- */
-static enum t_camera_orientation
-orientation_of(struct pimax_camera *pc, uint32_t cam)
-{
-	double r[9], t[3];
-	if (pimax_cam_calib_body_from_cam(&pc->calib, cam, r, t) != 0) {
-		return CAMERA_ORIENTATION_0;
-	}
-	double down_y = r[4];  // column 1 (image +y), body y component
-	double right_y = r[3]; // column 0 (image +x), body y component
-	if (down_y > 0.5) {
-		return CAMERA_ORIENTATION_180;
-	}
-	if (down_y < -0.5) {
-		return CAMERA_ORIENTATION_0;
-	}
-	CAM_WARN(pc, "camera %u is rolled ~90 deg (image right y=%.2f); orientation 90/270 not verified, using 0", cam,
-	         right_y);
-	return CAMERA_ORIENTATION_0;
-}
-
-static struct t_stereo_camera_calibration *
-make_stereo(struct pimax_camera *pc, uint32_t a, uint32_t b)
-{
-	struct t_stereo_camera_calibration *sc = NULL;
-	t_stereo_camera_calibration_alloc(&sc, T_DISTORTION_FISHEYE_KB4);
-	const uint32_t ids[2] = {a, b};
-	for (int v = 0; v < 2; v++) {
-		const pimax_cam_kb4 *k = &pc->calib.cameras[ids[v]].intr;
-		struct t_camera_calibration *tc = &sc->view[v];
-		tc->image_size_pixels.w = k->width;
-		tc->image_size_pixels.h = k->height;
-		t_camera_calibration_fill_intrinsics(tc, k->fx, k->fy, k->cx, k->cy);
-		tc->distortion_model = T_DISTORTION_FISHEYE_KB4;
-		tc->kb4.k1 = k->k[0];
-		tc->kb4.k2 = k->k[1];
-		tc->kb4.k3 = k->k[2];
-		tc->kb4.k4 = k->k[3];
-	}
-	double r[9], t[3];
-	if (pimax_cam_calib_stereo(&pc->calib, a, b, r, t) != 0) {
-		CAM_ERROR(pc, "stereo extrinsic %u-%u: %s", a, b, pimax_cam_last_error());
-		t_stereo_camera_calibration_reference(&sc, NULL);
-		return NULL;
-	}
-	for (int i = 0; i < 3; i++) {
-		for (int j = 0; j < 3; j++) {
-			sc->camera_rotation[i][j] = r[i * 3 + j];
-		}
-		sc->camera_translation[i] = t[i];
-	}
-	CAM_INFO(pc, "Mercury stereo: cameras %u (%s) + %u (%s), baseline %.1f mm", a, pc->calib.cameras[a].name, b,
-	         pc->calib.cameras[b].name, sqrt(t[0] * t[0] + t[1] * t[1] + t[2] * t[2]) * 1000.0);
-	return sc;
-}
-
-/*!
- * offset for multi_create_tracking_override(ATTACHED): pose of the head in the space of Mercury's output frame
- * (view-0 camera with -Z forward, +Y up). hand_in_head = head_from_camCV * Rx(180) * hand_in_camXR.
- */
-static bool
-make_attach_offset(struct pimax_camera *pc, struct xrt_pose *out_offset)
-{
-	double r0[9], t0[3], r1[9], t1[3];
-	if (pimax_cam_calib_body_from_cam(&pc->calib, pc->ht_cams[0], r0, t0) != 0 ||
-	    pimax_cam_calib_body_from_cam(&pc->calib, pc->ht_cams[1], r1, t1) != 0) {
-		CAM_WARN(pc, "calibration has no camera-IMU extrinsic; hands attached with identity");
-		*out_offset = (struct xrt_pose)XRT_POSE_IDENTITY;
-		return false;
-	}
-	// Head origin in the body (IMU) frame: between the two cameras, 5 cm behind them (estimate; see header).
-	struct xrt_vec3 head = {(float)((t0[0] + t1[0]) / 2), (float)((t0[1] + t1[1]) / 2),
-	                        (float)((t0[2] + t1[2]) / 2 + 0.05)};
-	const char *ho = debug_get_option_pimax_ht_head_offset();
-	if (ho != NULL) {
-		float x, y, z;
-		if (sscanf(ho, "%f,%f,%f", &x, &y, &z) == 3) {
-			head = (struct xrt_vec3){x, y, z};
-		} else {
-			CAM_WARN(pc, "PIMAX_HT_HEAD_OFFSET=%s ignored (want x,y,z in metres)", ho);
-		}
-	}
-	struct xrt_pose head_from_camcv;
-	mat9_to_quat(r0, &head_from_camcv.orientation);
-	head_from_camcv.position =
-	    (struct xrt_vec3){(float)t0[0] - head.x, (float)t0[1] - head.y, (float)t0[2] - head.z};
-	const struct xrt_pose rx180 = {.orientation = {.x = 1.0f, .y = 0.0f, .z = 0.0f, .w = 0.0f},
-	                               .position = {0, 0, 0}};
-	struct xrt_pose head_from_camxr;
-	math_pose_transform(&head_from_camcv, &rx180, &head_from_camxr);
-	math_pose_invert(&head_from_camxr, out_offset);
-	CAM_INFO(pc,
-	         "hands attached: head origin (%.3f %.3f %.3f) m in the IMU frame, camera %u at (%.3f %.3f %.3f) "
-	         "from the head",
-	         head.x, head.y, head.z, pc->ht_cams[0], head_from_camcv.position.x, head_from_camcv.position.y,
-	         head_from_camcv.position.z);
 	return true;
 }
 
@@ -434,39 +302,6 @@ tile_frame(struct pimax_camera *pc, uint32_t tile, uint64_t ts, const pimax_cam_
 	xf->source_sequence = fi->counter;
 	xf->source_id = tile;
 	return xf;
-}
-
-static void
-poll_mercury(struct pimax_camera *pc)
-{
-#ifdef XRT_BUILD_DRIVER_HANDTRACKING
-	if (!pc->stats_ht || pc->ht_raw == NULL) {
-		return;
-	}
-	// With HTA_PREDICTION_DISABLE=1 the async shim returns the timestamp of the last processed pair.
-	// The raw Mercury device answers in the view-0 camera frame (-Z forward, +Y up), metres.
-	const enum xrt_input_name names[2] = {XRT_INPUT_HT_UNOBSTRUCTED_LEFT, XRT_INPUT_HT_UNOBSTRUCTED_RIGHT};
-	int64_t now = os_monotonic_get_ns();
-	pc->win_polls++;
-	for (int h = 0; h < 2; h++) {
-		struct xrt_hand_joint_set set;
-		int64_t ts = 0;
-		if (xrt_device_get_hand_tracking(pc->ht_raw, names[h], now, &set, &ts) != XRT_SUCCESS) {
-			continue;
-		}
-		if (h == 0 && ts != pc->last_ht_ts) {
-			pc->last_ht_ts = ts;
-			pc->win_ht_updates++;
-		}
-		if (set.is_active) {
-			pc->win_active[h]++;
-			pc->last_wrist[h] =
-			    set.values.hand_joint_set_default[XRT_HAND_JOINT_WRIST].relation.pose.position;
-		}
-	}
-#else
-	(void)pc;
-#endif
 }
 
 //! One tracking frame through the auto-exposure controller; sends only in AE_SEND mode.
@@ -512,7 +347,6 @@ update_stats(struct pimax_camera *pc, int64_t now)
 	}
 	pc->fps = (float)(pc->win_frames / dt);
 	pc->tracking_fps = (float)(pc->win_tracking / dt);
-	pc->mercury_fps = (float)(pc->win_ht_updates / dt);
 	pimax_cam_stats st = {0};
 	pimax_cam_get_stats(pc->cam, &st);
 	CAM_INFO(pc,
@@ -546,21 +380,11 @@ update_stats(struct pimax_camera *pc, int64_t now)
 			         ti.max_corr_pos * 1000.0, ti.max_corr_rot * 57.2958, ti.blended, ti.snapped);
 		}
 	}
-	if (pc->stats_ht) {
-		CAM_INFO(pc, "mercury: %.2f processed pairs/s (SLAM placeholder got %" PRIu64 "/%" PRIu64 " frames)",
-		         pc->mercury_fps, pc->slam_stub_frames[0], pc->slam_stub_frames[1]);
-		for (int h = 0; h < 2; h++) {
-			struct xrt_vec3 w = pc->last_wrist[h];
-			CAM_INFO(pc,
-			         "mercury: %s hand active in %" PRIu64 "/%" PRIu64
-			         " polls%s (last wrist %.2f %.2f %.2f m, camera %u frame)",
-			         h == 0 ? "left" : "right", pc->win_active[h], pc->win_polls,
-			         pc->win_active[h] > 0 ? "" : ", none seen", w.x, w.y, w.z, pc->ht_cams[0]);
-		}
-	}
-	pc->win_polls = pc->win_active[0] = pc->win_active[1] = 0;
+#ifdef XRT_BUILD_DRIVER_HANDTRACKING
+	pimax_ht_log_stats(pc->ht);
+#endif
 	pc->win_start_ns = now;
-	pc->win_frames = pc->win_tracking = pc->win_ht_updates = 0;
+	pc->win_frames = pc->win_tracking = 0;
 }
 
 /*
@@ -1009,7 +833,6 @@ capture_thread(void *ptr)
 		pimax_cam_frame_info fi;
 		int r = pimax_cam_next(pc->cam, 200, &fi);
 		int64_t now = os_monotonic_get_ns();
-		poll_mercury(pc);
 		update_stats(pc, now);
 		if (r == 0) {
 			pc->timeouts++;
@@ -1048,7 +871,7 @@ capture_thread(void *ptr)
 		pc->win_tracking++;
 		ae_step(pc, now);
 		bool want_slam = pc->slam_on || pc->record_on;
-		bool want_ht = pc->entry[0] != NULL && pc->entry[1] != NULL;
+		bool want_ht = pc->ht != NULL;
 		if (!want_slam && !want_ht) {
 			continue;
 		}
@@ -1071,9 +894,10 @@ capture_thread(void *ptr)
 			}
 		}
 		if (want_ht && tiles[pc->ht_cams[0]] != NULL && tiles[pc->ht_cams[1]] != NULL) {
-			// Mercury's async shim requires left then right, from one thread.
-			xrt_sink_push_frame(pc->entry[0], tiles[pc->ht_cams[0]]);
-			xrt_sink_push_frame(pc->entry[1], tiles[pc->ht_cams[1]]);
+			// Never blocks: the hands thread takes the newest pair when it is free (and within its rate/duty).
+#ifdef XRT_BUILD_DRIVER_HANDTRACKING
+			pimax_ht_push(pc->ht, tiles[pc->ht_cams[0]], tiles[pc->ht_cams[1]]);
+#endif
 			pc->pairs_pushed++;
 		}
 		if (want_slam && imu_timed) {
@@ -1086,6 +910,17 @@ capture_thread(void *ptr)
 	return NULL;
 }
 
+#ifdef XRT_BUILD_DRIVER_HANDTRACKING
+static void
+head_at(struct xrt_device *hmd, int64_t at_ns, struct xrt_space_relation *out)
+{
+	pimax_hmd_head_relation_at(hmd, at_ns, out);
+}
+#endif
+
+/*!
+ * PIMAX_HANDS=mercury: camera hands (pimax_ht.c). Any failure only disables the hands; the HMD keeps running.
+ */
 static bool
 setup_mercury(struct pimax_camera *pc)
 {
@@ -1097,54 +932,44 @@ setup_mercury(struct pimax_camera *pc)
 		          pc->calib.camera_count);
 		return false;
 	}
-	pc->stereo = make_stereo(pc, pc->ht_cams[0], pc->ht_cams[1]);
-	if (pc->stereo == NULL) {
-		return false;
-	}
-
-	struct t_camera_extra_info extra = {0};
+	struct pimax_ht_config cfg = {0};
+	cfg.cams[0] = pc->ht_cams[0];
+	cfg.cams[1] = pc->ht_cams[1];
+	cfg.orient[0] = cfg.orient[1] = -1;
 	uint32_t orient_env[2];
-	for (int v = 0; v < 2; v++) {
-		extra.views[v].boundary_type = HT_IMAGE_BOUNDARY_NONE;
-		extra.views[v].camera_orientation = orientation_of(pc, pc->ht_cams[v]);
-	}
 	if (parse_u32_pair(debug_get_option_pimax_ht_orient(), orient_env)) {
-		for (int v = 0; v < 2; v++) {
-			extra.views[v].camera_orientation = (enum t_camera_orientation)orient_env[v];
+		cfg.orient[0] = (int)orient_env[0];
+		cfg.orient[1] = (int)orient_env[1];
+	}
+	// Same head origin as the 6DoF tracker (PIMAX_HT_HEAD_OFFSET overrides both), so hands and head agree.
+	double head[3];
+	const double *headp = NULL;
+	const char *ho = debug_get_option_pimax_ht_head_offset();
+	if (ho != NULL) {
+		if (sscanf(ho, "%lf,%lf,%lf", &head[0], &head[1], &head[2]) == 3) {
+			headp = head;
+		} else {
+			CAM_WARN(pc, "PIMAX_HT_HEAD_OFFSET=%s ignored (want x,y,z in metres)", ho);
 		}
 	}
-	CAM_INFO(pc, "Mercury view orientation: %d, %d deg", (int)extra.views[0].camera_orientation,
-	         (int)extra.views[1].camera_orientation);
-
-	struct t_hand_tracking_create_info create_info = {.cams_info = extra, .masks_sink = NULL};
-	struct xrt_slam_sinks *hand_sinks = NULL;
-	struct xrt_device *ht = NULL;
-	if (ht_device_create(&pc->xfctx, pc->stereo, create_info, &hand_sinks, &ht) != 0 || ht == NULL ||
-	    hand_sinks == NULL) {
-		CAM_ERROR(pc, "Mercury hand tracker could not be created (ONNX models in ~/.local/share/monado?)");
-		return false;
+	if (!pimax_ht_head_from_cam(&pc->calib, pc->ht_cams[0], headp, &cfg.head_from_cam)) {
+		CAM_WARN(pc, "calibration has no camera-IMU extrinsic; hands placed with an identity camera pose");
 	}
-	pc->ht_raw = ht;
-
-	// Entry per view: split to Mercury and to the (future) SLAM consumer.
-	pc->slam_stub[0].push_frame = slam_stub_push0;
-	pc->slam_stub[1].push_frame = slam_stub_push1;
-	for (int v = 0; v < 2; v++) {
-		u_sink_split_create(&pc->xfctx, hand_sinks->cams[v], &pc->slam_stub[v], &pc->entry[v]);
+	const char *roles = debug_get_option_pimax_ht_roles();
+	cfg.hand_roles = roles != NULL && strcmp(roles, "hands") == 0;
+	if (roles != NULL && !cfg.hand_roles && strcmp(roles, "tracking") != 0) {
+		CAM_WARN(pc, "PIMAX_HT_ROLES=%s unknown (tracking or hands); using tracking", roles);
 	}
-
-	struct xrt_pose offset;
-	make_attach_offset(pc, &offset);
-	pc->ht_dev = multi_create_tracking_override(XRT_TRACKING_OVERRIDE_ATTACHED, ht, pc->hmd,
-	                                            XRT_INPUT_GENERIC_HEAD_POSE, &offset);
-	if (pc->ht_dev == NULL) {
-		CAM_ERROR(pc, "could not attach the hand tracker to the HMD");
-		xrt_device_destroy(&pc->ht_raw);
-		return false;
-	}
-	snprintf(pc->ht_dev->str, XRT_DEVICE_NAME_LEN, "Pimax Dream Air Mercury hands");
-	snprintf(pc->ht_dev->serial, XRT_DEVICE_NAME_LEN, "Pimax Dream Air Mercury hands");
-	return true;
+	long nice_v = debug_get_num_option_pimax_ht_nice();
+	cfg.nice = nice_v < 0 ? 0 : (nice_v > 19 ? 19 : (int)nice_v);
+	cfg.max_hz = debug_get_float_option_pimax_ht_hz();
+	cfg.duty = debug_get_float_option_pimax_ht_duty();
+	cfg.stale_ms = (int)debug_get_num_option_pimax_ht_stale_ms();
+	cfg.predict_ms = debug_get_float_option_pimax_ht_predict_ms();
+	cfg.stats = pc->stats_ht;
+	cfg.log_level = pc->log_level;
+	pc->ht = pimax_ht_create(pc->hmd, head_at, &pc->calib, &cfg);
+	return pc->ht != NULL;
 #else
 	CAM_ERROR(pc, "PIMAX_HANDS=mercury but Monado was built without Mercury (needs ONNX Runtime + OpenCV)");
 	(void)pc;
@@ -1235,7 +1060,7 @@ pimax_camera_create(struct xrt_device *hmd,
 	if (want_hands && !setup_mercury(pc)) {
 		CAM_WARN(pc, "continuing without hand tracking");
 	}
-	pc->hands = pc->ht_dev != NULL;
+	pc->hands = pc->ht != NULL;
 
 	if ((want_slam || want_record) && pc->slam_lock_init && !setup_slam(pc, want_slam, record)) {
 		CAM_WARN(pc, "continuing without 6DoF/recording");
@@ -1266,7 +1091,7 @@ pimax_camera_create(struct xrt_device *hmd,
 	u_var_add_ro_f32(pc, &pc->fps, "fps");
 	u_var_add_ro_f32(pc, &pc->tracking_fps, "tracking fps");
 	u_var_add_ro_u64(pc, &pc->frames, "frames");
-	u_var_add_ro_u64(pc, &pc->pairs_pushed, "Mercury pairs pushed");
+	u_var_add_ro_u64(pc, &pc->pairs_pushed, "hand pairs offered");
 	if (pc->slam_on || pc->record_on) {
 		u_var_add_gui_header(pc, NULL, "6DoF / SLAM");
 		u_var_add_ro_text(pc, pc->slam_status, "6DoF state");
@@ -1293,19 +1118,22 @@ pimax_camera_create(struct xrt_device *hmd,
 		return NULL;
 	}
 	pc->thread_started = true;
-	CAM_INFO(pc, "camera pipeline up%s%s%s", pc->hands ? " with Mercury hand tracking" : "",
+	CAM_INFO(pc, "camera pipeline up%s%s%s", pc->hands ? " with camera hands (Mercury)" : "",
 	         pc->slam_on ? " with 6DoF SLAM" : "", pc->record_on ? " with EuRoC recording" : "");
 	return pc;
 }
 
-struct xrt_device *
-pimax_camera_take_hand_device(struct pimax_camera *pc)
+void
+pimax_camera_take_hand_devices(struct pimax_camera *pc, struct xrt_device *out[2])
 {
-	if (pc == NULL || pc->ht_dev == NULL || pc->ht_taken) {
-		return NULL;
+	out[0] = out[1] = NULL;
+#ifdef XRT_BUILD_DRIVER_HANDTRACKING
+	if (pc != NULL) {
+		pimax_ht_take_devices(pc->ht, out);
 	}
-	pc->ht_taken = true;
-	return pc->ht_dev;
+#else
+	(void)pc;
+#endif
 }
 
 void
@@ -1329,14 +1157,11 @@ pimax_camera_destroy(struct pimax_camera **pc_ptr)
 		}
 	}
 
-	// Mercury's async shim and the splits live in our frame context.
+#ifdef XRT_BUILD_DRIVER_HANDTRACKING
+	// Stops the hands thread before the HMD goes away (the devices then only report inactive hands).
+	pimax_ht_destroy(&pc->ht);
+#endif
 	xrt_frame_context_destroy_nodes(&pc->xfctx);
-
-	if (pc->ht_dev != NULL && !pc->ht_taken) {
-		// Never handed to the system: we own it (the wrapper destroys Mercury's device too).
-		xrt_device_destroy(&pc->ht_dev);
-	}
-	t_stereo_camera_calibration_reference(&pc->stereo, NULL);
 	if (pc->ae != NULL) {
 		CAM_INFO(pc, "AE %s", pc->ae_status);
 		pimax_cam_ae_destroy(pc->ae);

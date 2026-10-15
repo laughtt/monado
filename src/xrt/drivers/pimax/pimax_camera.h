@@ -112,11 +112,11 @@ pimax_camera_head_relation(struct pimax_camera *pc,
                            struct xrt_space_relation *out);
 
 /*!
- * The hand-tracking device (attached to the HMD pose), or NULL. Ownership moves to the caller (the system destroys
- * it); call at most once.
+ * The left and right camera hand devices (world-locked through the HMD pose), NULL each when hands are off.
+ * Ownership moves to the caller (the system destroys them); call at most once.
  */
-struct xrt_device *
-pimax_camera_take_hand_device(struct pimax_camera *pc);
+void
+pimax_camera_take_hand_devices(struct pimax_camera *pc, struct xrt_device *out[2]);
 
 /*! Stop capture and free everything (frame graph included). The HMD must outlive this call. */
 void
