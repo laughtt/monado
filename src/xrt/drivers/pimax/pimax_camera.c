@@ -459,11 +459,20 @@ slam_poll_locked(struct pimax_camera *pc, int64_t now_ns)
 	if (o.events & PIMAX_CAM_TRACK_EV_RESET_WANTED) {
 		// Raised after a long loss, or when the tracker drifts while the IMU says the headset lies still
 		// (no landmarks: Basalt integrates the IMU alone; pimax-cam StillParams, PIMAX_SLAM_STILL=0 disables).
-		CAM_WARN(pc, "6DoF: resetting the tracker (%s; reset %" PRIu64 ")", o.reason, o.resets);
+		// The still case is a re-zero: output held, no 6DoF loss (PIMAX_SLAM_STILL_REZERO=0: old drop to 3DoF).
+		if (o.events & PIMAX_CAM_TRACK_EV_REZEROED) {
+			CAM_INFO(pc, "6DoF: tracker re-zeroed while still (position held, no dropout; reset %" PRIu64 ")",
+			         o.resets);
+		} else {
+			CAM_WARN(pc, "6DoF: resetting the tracker (%s; reset %" PRIu64 ")", o.reason, o.resets);
+		}
 		t_slam_reset(pc->slam);
 	}
+	// A still re-zero is held output in a fresh tracker world, not a dropout (the state is Lost only internally).
+	const bool rezeroing = o.state == PIMAX_CAM_TRACK_LOST && strncmp(o.reason, "re-zeroed", 9) == 0;
 	snprintf(pc->slam_status, sizeof(pc->slam_status), "%s; %" PRIu64 " acquired, %" PRIu64 " lost, %s",
-	         track_state_name(o.state), o.acquisitions, o.losses, o.reason);
+	         rezeroing ? "6DoF tracking (re-zeroing while still, position held)" : track_state_name(o.state),
+	         o.acquisitions, o.losses, o.reason);
 }
 
 bool
