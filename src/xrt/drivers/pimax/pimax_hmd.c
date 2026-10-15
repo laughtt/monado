@@ -46,11 +46,13 @@
 #include "os/os_threading.h"
 
 #include <math.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/prctl.h>
+#include <unistd.h>
 
 DEBUG_GET_ONCE_LOG_OPTION(pimax_log, "PIMAX_LOG", U_LOGGING_INFO)
 //! TODO: the panels are mounted rotated by 90 deg (direction unknown). 0, 90, 180 or 270.
@@ -122,6 +124,13 @@ struct pimax_hmd
 	//! Eye gaze (XR_EXT_eye_gaze_interaction); NULL unless PIMAX_EYE=1.
 	struct pimax_eyeglue *eye;
 	struct os_mutex cam_lock;
+
+	//! HID link state from libpimax's on_state (session thread writes, any thread reads).
+	atomic_bool hid_connected;
+	//! Set after the first CONNECTED: later ones are reconnects.
+	bool hid_ever_connected;
+	uint32_t hid_losses;
+	int64_t hid_lost_at_ns;
 };
 
 static inline struct pimax_hmd *
@@ -406,10 +415,69 @@ pimax_on_controller_status(void *user, const pimax_controller_status *s)
 	pimax_ctrl_on_status(((struct pimax_hmd *)user)->ctrl, s);
 }
 
+/*!
+ * `$XDG_RUNTIME_DIR/pimax-hmd.state` (one line, replaced atomically on every HID link change), for pimaxd and the
+ * GUI: `state=connected|disconnected losses=N since_ns=<CLOCK_MONOTONIC> pid=<monado pid>`.
+ */
+static void
+hid_state_file_write(struct pimax_hmd *hmd, bool connected, int64_t now_ns)
+{
+	const char *xdg = getenv("XDG_RUNTIME_DIR");
+	if (xdg == NULL || xdg[0] == '\0') {
+		return;
+	}
+	char path[512], tmp[540];
+	snprintf(path, sizeof(path), "%s/pimax-hmd.state", xdg);
+	snprintf(tmp, sizeof(tmp), "%s.%d.tmp", path, (int)getpid());
+	FILE *f = fopen(tmp, "w");
+	if (f == NULL) {
+		return;
+	}
+	fprintf(f, "state=%s losses=%u since_ns=%lld pid=%d\n", connected ? "connected" : "disconnected",
+	        hmd->hid_losses, (long long)now_ns, (int)getpid());
+	if (fclose(f) != 0 || rename(tmp, path) != 0) {
+		unlink(tmp);
+	}
+}
+
+/*!
+ * Runs on the libpimax session thread (the same thread as pimax_on_imu, so the clock and fusion fields need no lock).
+ *
+ * libpimax reconnects the HID by itself after a re-enumeration and re-sends its wake; the keepalive resumes with the
+ * rate set by pimax_video_prepare. Nothing new is sent here. On loss the pose is held (not extrapolated, flagged not
+ * tracked) instead of freezing silently; on return the device clock mapping restarts (the MCU may have rebooted)
+ * and the fusion skips the gap instead of integrating the gyro over it.
+ */
 static void
 pimax_on_state(void *user, pimax_state state)
 {
-	pimax_ctrl_on_state(((struct pimax_hmd *)user)->ctrl, state);
+	struct pimax_hmd *hmd = (struct pimax_hmd *)user;
+	pimax_ctrl_on_state(hmd->ctrl, state);
+
+	int64_t now = os_monotonic_get_ns();
+	bool connected = state == PIMAX_CONNECTED;
+	bool was = atomic_load(&hmd->hid_connected);
+	if (connected == was && (connected || hmd->hid_ever_connected)) {
+		return;
+	}
+	if (connected) {
+		if (hmd->hid_ever_connected) {
+			HMD_WARN(hmd, "headset HID back after %.1f s (loss #%u): pose tracking resumes",
+			         (double)(now - hmd->hid_lost_at_ns) / 1e9, hmd->hid_losses);
+			hmd->have_clock = false;
+			hmd->fusion.state = M_IMU_3DOF_STATE_START;
+		}
+		hmd->hid_ever_connected = true;
+	} else {
+		hmd->hid_losses++;
+		hmd->hid_lost_at_ns = now;
+		HMD_ERROR(hmd,
+		          "headset HID lost (loss #%u): holding the last head pose (not tracked) until it returns; "
+		          "libpimax reconnects by itself",
+		          hmd->hid_losses);
+	}
+	atomic_store(&hmd->hid_connected, connected);
+	hid_state_file_write(hmd, connected, now);
 }
 
 static void
@@ -518,7 +586,17 @@ pimax_hmd_get_tracked_pose(struct xrt_device *xdev,
 	}
 
 	struct xrt_space_relation relation = XRT_SPACE_RELATION_ZERO;
-	m_relation_history_get(hmd->relation_hist, at_timestamp_ns, &relation);
+	const bool hid_lost = hmd->lib != NULL && hmd->hid_ever_connected && !atomic_load(&hmd->hid_connected);
+	if (hid_lost) {
+		// No IMU: hold the newest pose instead of extrapolating its angular velocity into a spin.
+		int64_t latest_ns = 0;
+		if (m_relation_history_get_latest(hmd->relation_hist, &latest_ns, &relation)) {
+			relation.angular_velocity = (struct xrt_vec3){0, 0, 0};
+			relation.linear_velocity = (struct xrt_vec3){0, 0, 0};
+		}
+	} else {
+		m_relation_history_get(hmd->relation_hist, at_timestamp_ns, &relation);
+	}
 
 	if ((relation.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) != 0) {
 		math_quat_normalize(&relation.pose.orientation);
@@ -528,6 +606,14 @@ pimax_hmd_get_tracked_pose(struct xrt_device *xdev,
 	struct xrt_space_relation rel6;
 	if (pimax_camera_head_relation(hmd->camera, at_timestamp_ns, &relation, &rel6)) {
 		relation = rel6;
+	}
+
+	if (hid_lost) {
+		// Valid but not tracked: clients can tell a held pose from a live one.
+		relation.relation_flags = (enum xrt_space_relation_flags)(
+		    relation.relation_flags &
+		    ~(XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
+		      XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT | XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT));
 	}
 
 	// Room anchor (PIMAX_ANCHOR=1): record the raw SLAM pose, then move the world by the offset from `pimax-anchor apply`.

@@ -10,6 +10,9 @@
  *   16 + 96*hand (0 left, 1 right): u64 frame_ns (CLOCK_MONOTONIC of the LED frame, 0 = never), u64 publish_ns,
  *   f32 pos[3] (head/body frame, metres), f32 quat[4] body_from_aim (x y z w), f32 rms_px, u32 leds, u32 cams,
  *   f32 aim_from_imu[4] (x y z w).
+ *   208: heartbeat (same version; 0 from older writers): u64 beat_ns (writer loop, CLOCK_MONOTONIC, at least every
+ *   0.5 s while alive), u64 led_frames, u32 source_up (0 = broker/camera reopening), u32 reopens. Not read here;
+ *   `pimax-ctrltrack health` prints it for pimaxd.
  * Body frame = OpenXR head axes (x right, y up, z back), the frame of the Pimax HMD pose.
  * @ingroup drv_pimax
  */
