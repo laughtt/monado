@@ -15,6 +15,11 @@
  *  - `pimax-anchor apply` writes the offset file ("pimax-anchor-offset 1", "pid N", "pose px py pz qx qy qz qw");
  *    it is re-read when it changes (checked every 250 ms) and applied as app_from_slam = offset * slam to the head
  *    pose, so controllers, hands-in-head-frame and the gaze ray move with it. Ignored unless pid is this process.
+ *  - small changes of the offset glide instead of jumping (the floor lock and periodic re-fixes write small steps):
+ *    the applied offset moves toward the file's at most PIMAX_ANCHOR_SLEW m/s (default 0.05) and
+ *    PIMAX_ANCHOR_SLEW_DEG deg/s (default 2), i.e. under 1 mm / 0.03 deg per 90 Hz frame. A change larger than
+ *    PIMAX_ANCHOR_SNAP m (default 0.25) or 5 deg, and the first offset of a session, is applied at once (a deliberate
+ *    placement). PIMAX_ANCHOR_SLEW=0 applies every change at once (the old behaviour).
  * @ingroup drv_pimax
  */
 
@@ -33,6 +38,9 @@
 #include <unistd.h>
 
 #include "math/m_api.h"
+#include "math/m_vec3.h"
+
+#include <math.h>
 #include "os/os_time.h"
 #include "util/u_logging.h"
 #include "xrt/xrt_defines.h"
@@ -57,6 +65,13 @@ struct pimax_anchor_state
 	long mtime_ns;
 	bool have_offset;
 	struct xrt_pose offset;
+	// what is applied now (moves toward `offset`)
+	bool have_applied;
+	struct xrt_pose applied;
+	int64_t last_step_ns;
+	float slew_m_s;
+	float slew_deg_s;
+	float snap_m;
 };
 
 static struct pimax_anchor_state g_pimax_anchor = {.lock = PTHREAD_MUTEX_INITIALIZER};
@@ -102,6 +117,12 @@ pimax_anchor_init_locked(struct pimax_anchor_state *s)
 		return;
 	}
 	s->ring = (uint8_t *)p;
+	const char *e = getenv("PIMAX_ANCHOR_SLEW");
+	s->slew_m_s = (e != NULL && e[0] != '\0') ? (float)atof(e) : 0.05f;
+	e = getenv("PIMAX_ANCHOR_SLEW_DEG");
+	s->slew_deg_s = (e != NULL && e[0] != '\0') ? (float)atof(e) : 2.0f;
+	e = getenv("PIMAX_ANCHOR_SNAP");
+	s->snap_m = (e != NULL && e[0] != '\0') ? (float)atof(e) : 0.25f;
 	uint32_t hdr[4] = {PIMAX_ANCHOR_MAGIC, 1, 0, (uint32_t)getpid()};
 	memcpy(s->ring, hdr, sizeof(hdr));
 	s->enabled = true;
@@ -118,6 +139,7 @@ pimax_anchor_refresh_offset_locked(struct pimax_anchor_state *s, int64_t now_ns)
 	struct stat st;
 	if (stat(s->offset_path, &st) != 0) {
 		s->have_offset = false;
+		s->have_applied = false;
 		s->mtime_s = 0;
 		return;
 	}
@@ -140,6 +162,7 @@ pimax_anchor_refresh_offset_locked(struct pimax_anchor_state *s, int64_t now_ns)
 	fclose(f);
 	if (!ok || pid != (unsigned)getpid()) {
 		s->have_offset = false;
+		s->have_applied = false;
 		return;
 	}
 	s->offset.position = (struct xrt_vec3){v[0], v[1], v[2]};
@@ -176,6 +199,58 @@ pimax_anchor_record_locked(struct pimax_anchor_state *s, int64_t at_ns, const st
 	atomic_store_explicit(seq, q0 + 2, memory_order_release);
 }
 
+//! Angle between two unit quaternions (rad).
+static inline float
+pimax_anchor_quat_angle(const struct xrt_quat *a, const struct xrt_quat *b)
+{
+	float d = fabsf(a->x * b->x + a->y * b->y + a->z * b->z + a->w * b->w);
+	return 2.0f * acosf(d > 1.0f ? 1.0f : d);
+}
+
+/*!
+ * Move the applied offset toward the file's (call with the lock held): glide small changes, snap big ones.
+ */
+static inline void
+pimax_anchor_step_locked(struct pimax_anchor_state *s, int64_t now_ns)
+{
+	float dt = s->last_step_ns > 0 ? (float)(now_ns - s->last_step_ns) * 1e-9f : 0.0f;
+	s->last_step_ns = now_ns;
+	if (dt < 0.0f) {
+		dt = 0.0f;
+	}
+	if (dt > 0.1f) {
+		dt = 0.1f;
+	}
+	struct xrt_pose *a = &s->applied;
+	const struct xrt_pose *t = &s->offset;
+	struct xrt_vec3 dp = m_vec3_sub(t->position, a->position);
+	float dist = m_vec3_len(dp);
+	float ang = pimax_anchor_quat_angle(&a->orientation, &t->orientation);
+	if (!s->have_applied || s->slew_m_s <= 0.0f || dist > s->snap_m || ang > 5.0f * (float)M_PI / 180.0f) {
+		if (s->have_applied && (dist > 0.002f || ang > 0.001f)) {
+			U_LOG_I("PIMAX_ANCHOR: offset placed at once (%.3f m, %.2f deg)", dist, ang * 180.0f / (float)M_PI);
+		}
+		*a = *t;
+		s->have_applied = true;
+		return;
+	}
+	float max_d = s->slew_m_s * dt;
+	if (dist <= max_d) {
+		a->position = t->position;
+	} else {
+		a->position = m_vec3_add(a->position, m_vec3_mul_scalar(dp, max_d / dist));
+	}
+	float max_a = s->slew_deg_s * (float)M_PI / 180.0f * dt;
+	if (ang <= max_a || ang < 1e-6f) {
+		a->orientation = t->orientation;
+	} else {
+		struct xrt_quat q;
+		math_quat_slerp(&a->orientation, &t->orientation, max_a / ang, &q);
+		math_quat_normalize(&q);
+		a->orientation = q;
+	}
+}
+
 /*!
  * Record the raw relation (SLAM world) and apply the offset to it in place. Cheap when PIMAX_ANCHOR is not set.
  */
@@ -192,9 +267,13 @@ pimax_anchor_process(int64_t at_ns, struct xrt_space_relation *rel)
 		return;
 	}
 	pimax_anchor_record_locked(s, at_ns, rel);
-	pimax_anchor_refresh_offset_locked(s, (int64_t)os_monotonic_get_ns());
+	int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	pimax_anchor_refresh_offset_locked(s, now_ns);
 	bool have = s->have_offset;
-	struct xrt_pose off = s->offset;
+	if (have) {
+		pimax_anchor_step_locked(s, now_ns);
+	}
+	struct xrt_pose off = s->applied;
 	pthread_mutex_unlock(&s->lock);
 	if (!have) {
 		return;
