@@ -13,7 +13,7 @@
  * PIMAX_CTRL_TRACK=1: optical 6DoF from `pimax-ctrltrack live` (pimax-re rust/pimax-ctrltrack: controller LEDs in the
  * camera LED frames -> pose in the head frame, seqlock file pimax_ctrltrack_shm.h). The pose is composed with the head
  * pose at the LED frame's time and handed to the fuser in rust/pimax-hands (fuse.rs, pimax_ctrlfuse.h): gyro
- * orientation between fixes (calibration learned online from the optical poses, ~/.config/pimax/ctrl-imu.json), short
+ * orientation between fixes (calibration learned online from the optical poses, ~/.config/omarchyvr/ctrl-imu.json), short
  * extrapolation, then an arm-model hold relative to the head, the synthesized pose above only after
  * PIMAX_CTRL_TRACK_LOST_S (4 s); reacquire blends over 100 ms, optical outliers are dropped. The optical grip is
  * aim * the Quest 2 Touch openxr_aim -> openxr_grip transform (PIMAX_TOUCH_GRIP), so SteamVR's aim equals ours.

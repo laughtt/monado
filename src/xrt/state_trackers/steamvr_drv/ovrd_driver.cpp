@@ -63,7 +63,7 @@ DEBUG_GET_ONCE_BOOL_OPTION(pimax_slam_head, "PIMAX_SLAM", false)
 
 /*!
  * PIMAX_STEAMVR_ENV: vrserver does not get the environment `pimax vr start` gives monado-service, so the driver reads
- * the same Pimax settings from $PIMAX_STEAMVR_ENV_FILE, else ~/.config/pimax/steamvr-driver.env (KEY=VALUE lines,
+ * the same Pimax settings from $PIMAX_STEAMVR_ENV_FILE, else ~/.config/omarchyvr/steamvr-driver.env (old: ~/.config/pimax; KEY=VALUE lines,
  * written by `pimax vr start` with "Games run with: SteamVR"). Must run before anything calls debug_get_*.
  */
 static void
@@ -75,9 +75,15 @@ pimax_steamvr_load_env(void)
 		snprintf(path, sizeof(path), "%s", file);
 	} else {
 		const char *home = getenv("HOME");
-		snprintf(path, sizeof(path), "%s/.config/pimax/steamvr-driver.env", home != NULL ? home : "");
+		snprintf(path, sizeof(path), "%s/.config/omarchyvr/steamvr-driver.env", home != NULL ? home : "");
 	}
 	FILE *f = fopen(path, "r");
+	if (f == NULL && (file == NULL || file[0] == '\0')) {
+		// an install from before the rename (the app moves ~/.config/pimax on its first start)
+		const char *home = getenv("HOME");
+		snprintf(path, sizeof(path), "%s/.config/pimax/steamvr-driver.env", home != NULL ? home : "");
+		f = fopen(path, "r");
+	}
 	if (f == NULL) {
 		ovrd_log("PIMAX_STEAMVR_ENV: no %s, using the environment as it is\n", path);
 		return;

@@ -8,7 +8,7 @@
  * headset is still (window restarts on motion), the mean is used as gyro bias (the factory wBias is wrong,
  * see analysis/imu-orientation.md) and the initial tilt is seeded from the mean accelerometer.
  * If no still window comes within PIMAX_BIAS_TIMEOUT_MS (default 3000, e.g. started while worn), tracking starts
- * with the bias cached by the last good calibration (~/.cache/pimax/gyro-bias, else zero) and the window keeps
+ * with the bias cached by the last good calibration (~/.cache/omarchyvr/gyro-bias, old ~/.cache/pimax, else zero) and the window keeps
  * running: every later still window replaces the bias.
  *
  * @ingroup drv_pimax
@@ -247,16 +247,24 @@ bias_restart(struct pimax_hmd *hmd)
 	}
 }
 
+//! The gyro bias cache: <cache>/omarchyvr/gyro-bias (the app's cache dir); `legacy` gives the old
+//! <cache>/pimax/gyro-bias, still read when the new file does not exist yet.
 static void
-bias_cache_path(char *out, size_t n)
+bias_cache_path_dir(char *out, size_t n, const char *dir)
 {
 	const char *xdg = getenv("XDG_CACHE_HOME");
 	const char *home = getenv("HOME");
 	if (xdg != NULL && xdg[0] != '\0') {
-		snprintf(out, n, "%s/pimax/gyro-bias", xdg);
+		snprintf(out, n, "%s/%s/gyro-bias", xdg, dir);
 	} else {
-		snprintf(out, n, "%s/.cache/pimax/gyro-bias", home != NULL ? home : "/tmp");
+		snprintf(out, n, "%s/.cache/%s/gyro-bias", home != NULL ? home : "/tmp", dir);
 	}
+}
+
+static void
+bias_cache_path(char *out, size_t n)
+{
+	bias_cache_path_dir(out, n, "omarchyvr");
 }
 
 static bool
@@ -265,6 +273,10 @@ bias_cache_load(float g[3])
 	char path[512];
 	bias_cache_path(path, sizeof(path));
 	FILE *f = fopen(path, "r");
+	if (f == NULL) {
+		bias_cache_path_dir(path, sizeof(path), "pimax");
+		f = fopen(path, "r");
+	}
 	if (f == NULL) {
 		return false;
 	}
@@ -818,7 +830,7 @@ pimax_hmd_create(struct xrt_device *out_ctrls[2])
 	hmd->base.hmd->screens[0].w_pixels = eye_w * 2;
 	hmd->base.hmd->screens[0].h_pixels = eye_h;
 
-	// Lens model + FOV from ~/.config/pimax/lens.conf (or PIMAX_LENS_CONF), see analysis/lens-distortion.md.
+	// Lens model + FOV from ~/.config/omarchyvr/lens.conf (or PIMAX_LENS_CONF), see analysis/lens-distortion.md.
 	pimax_lens_load(&hmd->lens, (float)PIMAX_EYE_H / (float)PIMAX_EYE_W);
 	hmd->base.hmd->distortion.fov[0] = pimax_lens_get_fov(&hmd->lens, 0);
 	hmd->base.hmd->distortion.fov[1] = pimax_lens_get_fov(&hmd->lens, 1);

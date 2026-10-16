@@ -745,7 +745,7 @@ default_record_path(char *out, size_t len)
 	localtime_r(&now, &tm);
 	char stamp[32];
 	strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm);
-	snprintf(out, len, "%s/.local/share/pimax/slam-recordings/%s", home != NULL ? home : ".", stamp);
+	snprintf(out, len, "%s/.local/share/omarchyvr/slam-recordings/%s", home != NULL ? home : ".", stamp);
 }
 
 //! PIMAX_SLAM / PIMAX_SLAM_RECORD. Returns false only on a configuration error.

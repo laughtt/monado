@@ -6,7 +6,7 @@
  *
  * The distortion math, the lens.conf parser, the visibility mask and the debug UV grid all live in Rust
  * (libpimax_lens.a, header pimax_lens_rs.h); this file only converts types for Monado.
- * Config: ~/.config/pimax/lens.conf, see analysis/lens-distortion.md and analysis/tools/lens.conf.example.
+ * Config: ~/.config/omarchyvr/lens.conf, see analysis/lens-distortion.md and analysis/tools/lens.conf.example.
  * Debug: PIMAX_LENS_DEBUG_GRID=<dir> writes the UV grid pictures of both eyes at start-up, PIMAX_LENS_OFF=1 turns
  * the distortion off, PIMAX_LENS_CONF=<file> picks the config file.
  *
@@ -30,7 +30,7 @@ struct pimax_lens
 	struct pimax_lens_rs *rs;
 };
 
-//! Load the lens model: defaults, then the config file (PIMAX_LENS_CONF or ~/.config/pimax/lens.conf).
+//! Load the lens model: defaults, then the config file (PIMAX_LENS_CONF or ~/.config/omarchyvr/lens.conf).
 //! @a aspect is the display width / height as the client sees it (3840/3552).
 void
 pimax_lens_load(struct pimax_lens *lens, float aspect);
