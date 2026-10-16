@@ -15,7 +15,8 @@
  * pose at the LED frame's time and handed to the fuser in rust/pimax-hands (fuse.rs, pimax_ctrlfuse.h): gyro
  * orientation between fixes (calibration learned online from the optical poses, ~/.config/pimax/ctrl-imu.json), short
  * extrapolation, then an arm-model hold relative to the head, the synthesized pose above only after
- * PIMAX_CTRL_TRACK_LOST_S (4 s); reacquire blends over 100 ms, optical outliers are dropped.
+ * PIMAX_CTRL_TRACK_LOST_S (4 s); reacquire blends over 100 ms, optical outliers are dropped. The optical grip is
+ * aim * the Quest 2 Touch openxr_aim -> openxr_grip transform (PIMAX_TOUCH_GRIP), so SteamVR's aim equals ours.
  * Also offered as /interaction_profiles/ext/hand_interaction_ext (pinch = trigger, grasp = squeeze) for apps that
  * only suggest hand-interaction bindings; apps with Touch bindings keep the Touch profile.
  *
@@ -105,6 +106,7 @@ struct pimax_ctrl_ctx
 	bool hands_demo;  // scripted input instead of reports (PIMAX_CTRL_HANDS_DEMO)
 	bool hands_eager; // PIMAX_CTRL_HANDS_FEED=report: feed Rust on the session thread (old behaviour)
 	struct xrt_pose aim_to_grip; // fixed grip pitch relative to the aim (IMU mode), from pimax-hands
+	struct xrt_pose tracked_aim_to_grip; // optical: Touch (Quest 2) geometry, rotation + offset, from pimax-hands
 
 	// Optical 6DoF (PIMAX_CTRL_TRACK=1): poses from `pimax-ctrltrack live` (seqlock file, pimax_ctrltrack_shm.h).
 	bool track;
@@ -511,9 +513,14 @@ optical_pose(struct pimax_controller *c, int64_t at_ns, enum xrt_input_name name
 	}
 	struct xrt_pose pose = pose_from_rust(&aim);
 	if (name == XRT_INPUT_TOUCH_GRIP_POSE) {
-		struct xrt_quat a2g = ctx->aim_to_grip.orientation;
-		math_quat_rotate(&pose.orientation, &a2g, &pose.orientation);
-		math_quat_normalize(&pose.orientation);
+		// grip = aim * tracked_aim_to_grip: the Oculus Touch (Quest 2) openxr_aim -> openxr_grip transform (60 deg
+		// pitch, handle centre 3.0 cm below and 9.5 cm behind the ray origin). SteamVR (Touch raw = grip *
+		// inverse(openxr_grip), aim = raw * openxr_aim) then derives exactly this aim; the old orientation-only 45 deg
+		// rule put SteamVR's ray 15 deg lower and the grip at the LED ring (rust/pimax-hands touch.rs).
+		struct xrt_pose grip;
+		math_pose_transform(&pose, &ctx->tracked_aim_to_grip, &grip);
+		math_quat_normalize(&grip.orientation);
+		pose = grip;
 	}
 	struct xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
 	rel.pose = pose;
@@ -1085,6 +1092,15 @@ pimax_ctrl_create(struct xrt_device *head, enum u_logging_level log_level, struc
 	pimax_hands_pose a2g;
 	pimax_hands_aim_to_grip(&a2g);
 	ctx->aim_to_grip = pose_from_rust(&a2g);
+	pimax_hands_tracked_aim_to_grip(&a2g);
+	ctx->tracked_aim_to_grip = pose_from_rust(&a2g);
+	U_LOG_IFL_I(log_level,
+	            "Pimax controllers: PIMAX_TOUCH_GRIP tracked grip = aim * (%.4f %.4f %.4f, quat %.4f %.4f %.4f %.4f) "
+	            "(Quest 2 Touch openxr_aim -> openxr_grip, same aim as SteamVR)",
+	            ctx->tracked_aim_to_grip.position.x, ctx->tracked_aim_to_grip.position.y,
+	            ctx->tracked_aim_to_grip.position.z, ctx->tracked_aim_to_grip.orientation.x,
+	            ctx->tracked_aim_to_grip.orientation.y, ctx->tracked_aim_to_grip.orientation.z,
+	            ctx->tracked_aim_to_grip.orientation.w);
 	char placement[256];
 	if (pimax_hands_controller_describe(placement, sizeof(placement)) != 0) {
 		U_LOG_IFL_W(log_level, "Pimax controllers: %s", placement);
