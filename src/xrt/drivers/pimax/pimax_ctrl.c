@@ -20,6 +20,12 @@
  * Also offered as /interaction_profiles/ext/hand_interaction_ext (pinch = trigger, grasp = squeeze) for apps that
  * only suggest hand-interaction bindings; apps with Touch bindings keep the Touch profile.
  *
+ * In hand (PIMAX_CTRL_INHAND, rust/pimax-hands inhand.rs, docs/CONTROLLERS-INHAND.md): auto = a controller is only
+ * shown while it is in the hand (IMU motion or an input change picks it up, 5 s still or 1.5 s without reports puts it
+ * down); while down it reports no pose and inactive inputs, so WayVR draws neither model nor ray for a controller
+ * lying on the desk. always (the driver's default, games) = as before; off = never shown. `pimax desk` passes auto.
+ * Run-time change: $XDG_RUNTIME_DIR/pimax-ctrl-inhand-mode; status: $XDG_RUNTIME_DIR/pimax-ctrl-inhand.
+ *
  * Hand tracking (XR_EXT_hand_tracking, data source CONTROLLER): the finger curls come from the Rust crate pimax-hands
  * (trigger -> index, grip -> middle/ring/little, touch bits -> thumb; filters + thumb state machine live there), this
  * file only feeds it the decoded reports and runs Monado's u_hand_sim_simulate_generic on the result. The hand is
@@ -56,6 +62,7 @@
 #include "pimax_ctrlfuse.h"
 #include "pimax_ctrltrack_shm.h"
 #include "pimax_hands.h"
+#include "pimax_inhand.h"
 
 #include <math.h>
 #include <pthread.h>
@@ -131,6 +138,9 @@ struct pimax_ctrl_ctx
 	bool thread_running;
 	atomic_bool stop;
 	atomic_bool need_attach_all; // set on (re)connect
+
+	// In hand (PIMAX_CTRL_INHAND): PIMAX_INHAND_MODE_*, changed at run time by the attach thread.
+	atomic_int inhand_mode;
 };
 
 struct pimax_controller
@@ -178,6 +188,10 @@ struct pimax_controller
 	// Optical fix (lock): the last pose from pimax-ctrltrack, anchored in the tracking origin at its frame time.
 	int fuse_state;        // last PIMAX_CTRLFUSE_* returned (log on change)
 	pimax_ctrlfuse *fuse;  // rust/pimax-hands fuse.rs: out-of-view hold, gyro, reacquire blend, gyro calibration
+
+	// In hand: the detector (own lock) and the last visibility logged (attach thread).
+	pimax_inhand *inhand;
+	int shown_logged; // -1 unknown, 0 hidden, 1 shown
 
 	// Attach logic (written from the session thread and the attach thread, atomics).
 	_Atomic uint64_t last_status_ns;
@@ -314,6 +328,9 @@ pimax_ctl_destroy(struct xrt_device *xdev)
 	c->fuse = NULL;
 	pthread_mutex_unlock(&c->lock);
 	pimax_hands_destroy(hands);
+	pimax_inhand *inhand = c->inhand;
+	c->inhand = NULL;
+	pimax_inhand_destroy(inhand);
 	if (fuse != NULL) {
 		char d[256];
 		pimax_ctrlfuse_describe(fuse, d, sizeof(d));
@@ -331,6 +348,23 @@ clampf(float v, float lo, float hi)
 	return v < lo ? lo : (v > hi ? hi : v);
 }
 
+/*!
+ * PIMAX_CTRL_INHAND: should this controller be shown now? always: yes; off: no; auto: only while it is in the hand
+ * (rust/pimax-hands inhand.rs). The demo pattern is always shown.
+ */
+static bool
+ctl_shown(struct pimax_controller *c, uint64_t now)
+{
+	if (c->ctx->hands_demo) {
+		return true;
+	}
+	switch (atomic_load(&c->ctx->inhand_mode)) {
+	case PIMAX_INHAND_MODE_ALWAYS: return true;
+	case PIMAX_INHAND_MODE_OFF: return false;
+	default: return pimax_inhand_held(c->inhand, now) != 0;
+	}
+}
+
 static xrt_result_t
 pimax_ctl_update_inputs(struct xrt_device *xdev)
 {
@@ -338,8 +372,9 @@ pimax_ctl_update_inputs(struct xrt_device *xdev)
 	bool left = c->index == 0;
 	uint64_t now = os_monotonic_get_ns();
 
+	bool shown = ctl_shown(c, now);
 	pthread_mutex_lock(&c->lock);
-	bool active = c->have_report && (now - c->last_report_ns) < ACTIVE_TIMEOUT_NS;
+	bool active = shown && c->have_report && (now - c->last_report_ns) < ACTIVE_TIMEOUT_NS;
 	uint64_t ts = c->have_report ? (int64_t)c->last_report_ns : (int64_t)now;
 	if (c->ctx->hands_demo) {
 		// Test aid: the scripted demo input (the one that drives the fingers) also drives trigger and squeeze, so
@@ -371,8 +406,8 @@ pimax_ctl_update_inputs(struct xrt_device *xdev)
 		in[i].active = active;
 		in[i].timestamp = (int64_t)ts;
 	}
-	// Poses are synthesized (fixed offset from the head), so they are always active.
-	in[I_GRIP_POSE].active = in[I_AIM_POSE].active = true;
+	// Poses are synthesized or tracked, so they are active, unless the controller is put down (PIMAX_CTRL_INHAND).
+	in[I_GRIP_POSE].active = in[I_AIM_POSE].active = shown;
 	in[I_GRIP_POSE].timestamp = in[I_AIM_POSE].timestamp = (int64_t)now;
 	return XRT_SUCCESS;
 }
@@ -546,6 +581,12 @@ pimax_ctl_get_tracked_pose(struct xrt_device *xdev,
 		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
 
+	if (!ctl_shown(c, os_monotonic_get_ns())) {
+		// PIMAX_CTRL_INHAND: lying on the desk (or switched off): no pose at all, so nothing is drawn for it
+		*out_relation = (struct xrt_space_relation)XRT_SPACE_RELATION_ZERO;
+		return XRT_SUCCESS;
+	}
+
 	if (c->ctx->track && optical_pose(c, at_timestamp_ns, name, out_relation)) {
 		return XRT_SUCCESS;
 	}
@@ -626,8 +667,9 @@ pimax_ctl_get_hand_tracking(struct xrt_device *xdev,
 
 	uint64_t now = os_monotonic_get_ns();
 	pimax_hands_out ho;
+	bool shown = ctl_shown(c, now);
 	pthread_mutex_lock(&c->lock);
-	bool active = c->have_report && (now - c->last_report_ns) < ACTIVE_TIMEOUT_NS;
+	bool active = shown && c->have_report && (now - c->last_report_ns) < ACTIVE_TIMEOUT_NS;
 	if (c->ctx->hands_demo) {
 		// Scripted input instead of reports; always "active" so a test needs no awake controller.
 		pimax_hands_input demo;
@@ -642,7 +684,7 @@ pimax_ctl_get_hand_tracking(struct xrt_device *xdev,
 	if (active != c->hand_active_logged) {
 		c->hand_active_logged = active;
 		U_LOG_IFL_I(c->ctx->log_level, "hand tracking %s: %s (last report %.1f s ago)", left ? "left" : "right",
-		            active ? "active" : "inactive (no controller report)",
+		            active ? "active" : (shown ? "inactive (no controller report)" : "inactive (controller put down)"),
 		            c->have_report ? (double)(now - c->last_report_ns) / 1e9 : -1.0);
 	}
 	pthread_mutex_unlock(&c->lock);
@@ -830,6 +872,8 @@ pimax_ctrl_on_report(struct pimax_ctrl_ctx *ctx, const pimax_controller_report *
 	if (c->fuse != NULL) {
 		pimax_ctrlfuse_report(c->fuse, now, r->raw); // own lock
 	}
+	// own lock; IMU + input changes -> in the hand or not
+	pimax_inhand_report(c->inhand, now, r->raw, r->trigger, r->grip, r->stick_x, r->stick_y, r->buttons, r->touch);
 	if (ctx->imu_mode) {
 		imu_update(c, r, now);
 	}
@@ -901,6 +945,30 @@ attach_thread(void *arg)
 				do_attach(ctx, c, "0x37 heartbeat without reports");
 			}
 		}
+		// PIMAX_CTRL_INHAND: a mode change from the app / CLI / voice, the visibility log and the status file.
+		int req = pimax_inhand_poll_mode();
+		if (req >= 0 && req != atomic_load(&ctx->inhand_mode)) {
+			atomic_store(&ctx->inhand_mode, req);
+			U_LOG_IFL_I(ctx->log_level, "PIMAX_CTRL_INHAND: controllers %s (run-time change)",
+			            pimax_inhand_mode_name(req));
+		}
+		for (int i = 0; i < 2; i++) {
+			struct pimax_controller *c = ctx->ctl[i];
+			if (c == NULL) {
+				continue;
+			}
+			int shown = ctl_shown(c, now) ? 1 : 0;
+			if (shown != c->shown_logged) {
+				char d[96];
+				pimax_inhand_describe(c->inhand, now, d, sizeof(d));
+				U_LOG_IFL_I(ctx->log_level, "PIMAX_CTRL_INHAND: %s controller %s (%s, mode %s)", i == 0 ? "left" : "right",
+				            shown ? "shown" : "hidden", d, pimax_inhand_mode_name(atomic_load(&ctx->inhand_mode)));
+				c->shown_logged = shown;
+			}
+		}
+		pimax_inhand_publish(atomic_load(&ctx->inhand_mode), ctx->ctl[0] ? ctx->ctl[0]->inhand : NULL,
+		                     ctx->ctl[1] ? ctx->ctl[1]->inhand : NULL, now);
+
 		// Test pulse from the app / `pimax controllers buzz` ($XDG_RUNTIME_DIR/pimax-haptic-request).
 		int hs = pimax_haptic_poll_request(ctx->lib);
 		if (hs > 0) {
@@ -1011,6 +1079,8 @@ ctl_create(struct pimax_ctrl_ctx *ctx, int index)
 	if (ctx->hands) {
 		c->hands = pimax_hands_create();
 	}
+	c->inhand = pimax_inhand_create(left ? 0 : 1);
+	c->shown_logged = -1;
 	if (ctx->track) {
 		c->fuse = pimax_ctrlfuse_create(left ? 0 : 1);
 		char d[256];
@@ -1083,6 +1153,13 @@ pimax_ctrl_create(struct xrt_device *head, enum u_logging_level log_level, struc
 	const char *feed = debug_get_option_pimax_ctrl_hands_feed();
 	ctx->hands_eager = ctx->hands && feed != NULL && strcmp(feed, "report") == 0;
 	ctx->track = debug_get_bool_option_pimax_ctrl_track();
+	// in hand: always unless PIMAX_CTRL_INHAND says otherwise (`pimax desk` passes auto, games keep always)
+	atomic_store(&ctx->inhand_mode, pimax_inhand_mode_from_env(PIMAX_INHAND_MODE_ALWAYS));
+	pimax_inhand_clear_request();
+	U_LOG_IFL_I(log_level,
+	            "Pimax controllers: PIMAX_CTRL_INHAND=%s (auto: shown only while in the hand; 5 s still or no reports "
+	            "for 1.5 s = put down, motion > 3.7 deg/s for 120 ms, a tilt or an input = picked up)",
+	            pimax_inhand_mode_name(atomic_load(&ctx->inhand_mode)));
 	pthread_mutex_init(&ctx->track_lock, NULL);
 	pimax_ctrltrack_default_path(ctx->track_path, sizeof(ctx->track_path));
 	if (ctx->track) {
