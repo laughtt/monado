@@ -144,3 +144,11 @@ endif()
 if(XRT_HAVE_VULKAN AND XRT_HAVE_D3D12)
 	target_link_libraries(tests_aux_d3d_d3d12 PRIVATE comp_util aux_vk)
 endif()
+
+# Pimax room anchor hook (header only, plain C): one ring owner per session, taken back after a replacement.
+if(XRT_BUILD_DRIVER_PIMAX)
+	add_executable(tests_pimax_anchor tests_pimax_anchor.c)
+	target_link_libraries(tests_pimax_anchor PRIVATE aux_util aux_math aux_os)
+	add_test(NAME tests_pimax_anchor COMMAND tests_pimax_anchor)
+	set_target_properties(tests_pimax_anchor PROPERTIES FOLDER monado_tests)
+endif()

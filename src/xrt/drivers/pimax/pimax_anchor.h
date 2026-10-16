@@ -20,12 +20,21 @@
  *    PIMAX_ANCHOR_SLEW_DEG deg/s (default 2), i.e. under 1 mm / 0.03 deg per 90 Hz frame. A change larger than
  *    PIMAX_ANCHOR_SNAP m (default 0.25) or 5 deg, and the first offset of a session, is applied at once (a deliberate
  *    placement). PIMAX_ANCHOR_SLEW=0 applies every change at once (the old behaviour).
+ *  - one owner per session (live failure 2026-10-16: a room setup panel started SteamVR, whose Monado driver opened
+ *    the headset inside vrserver, deleted the offset file, recreated the ring with its own pid and exited; the real
+ *    monado-service kept writing into the unlinked file, so readers saw a dead pid and no poses):
+ *    at start, a ring whose writer is another live process with a sample in the last 10 s is left alone, and so is
+ *    the offset file (the room anchor is off in this process, logged); the ring is created under a temporary name
+ *    with its header and renamed into place; once a second the writer checks the path still is its file and takes
+ *    it back when it was replaced or removed and no other live writer keeps it fresh.
  * @ingroup drv_pimax
  */
 
 #pragma once
 
+#include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -59,6 +68,11 @@ struct pimax_anchor_state
 	uint8_t *ring;
 	uint32_t next;
 	int64_t last_ring_ns;
+	char ring_path[512];
+	dev_t ring_dev;
+	ino_t ring_ino;
+	int64_t last_ring_check_ns;
+	uint32_t foreign_pid; //!< last other live writer logged (0: none)
 	char offset_path[512];
 	int64_t last_check_ns;
 	time_t mtime_s;
@@ -88,6 +102,98 @@ pimax_anchor_path(const char *envname, const char *leaf, char *out, size_t n)
 	snprintf(out, n, "%s/%s", (d != NULL && d[0] != '\0') ? d : "/tmp", leaf);
 }
 
+static inline bool
+pimax_anchor_pid_alive(uint32_t pid)
+{
+	if (pid == 0 || pid > (uint32_t)INT32_MAX) {
+		return false;
+	}
+	return kill((pid_t)pid, 0) == 0 || errno == EPERM;
+}
+
+/*!
+ * The pid of another live process that keeps the ring at @p path fresh (valid header, writer is not us and runs,
+ * newest sample at most 10 s old), else 0.
+ */
+static inline uint32_t
+pimax_anchor_live_owner(const char *path)
+{
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) {
+		return 0;
+	}
+	uint8_t buf[PIMAX_ANCHOR_SIZE];
+	ssize_t n = pread(fd, buf, sizeof(buf), 0);
+	close(fd);
+	if (n != (ssize_t)sizeof(buf)) {
+		return 0;
+	}
+	uint32_t hdr[4];
+	memcpy(hdr, buf, sizeof(hdr));
+	if (hdr[0] != PIMAX_ANCHOR_MAGIC || hdr[1] != 1 || hdr[3] == (uint32_t)getpid() || !pimax_anchor_pid_alive(hdr[3])) {
+		return 0;
+	}
+	uint64_t newest = 0;
+	for (size_t i = 0; i < PIMAX_ANCHOR_SLOTS; i++) {
+		uint64_t ts;
+		memcpy(&ts, buf + PIMAX_ANCHOR_HDR + i * PIMAX_ANCHOR_SLOT, 8);
+		if (ts > newest) {
+			newest = ts;
+		}
+	}
+	int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	if (newest == 0 || now_ns - (int64_t)newest > 10LL * 1000 * 1000 * 1000) {
+		return 0;
+	}
+	return hdr[3];
+}
+
+/*!
+ * (Re)create the head ring at s->ring_path: a temporary file with the header, renamed into place (a reader never
+ * sees a file without header). Call with the lock held.
+ */
+static inline bool
+pimax_anchor_create_ring_locked(struct pimax_anchor_state *s)
+{
+	char tmp[600];
+	snprintf(tmp, sizeof(tmp), "%s.%d.tmp", s->ring_path, (int)getpid());
+	int fd = open(tmp, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+	if (fd < 0 || ftruncate(fd, PIMAX_ANCHOR_SIZE) != 0) {
+		U_LOG_E("PIMAX_ANCHOR: cannot create %s", tmp);
+		if (fd >= 0) {
+			close(fd);
+			unlink(tmp);
+		}
+		return false;
+	}
+	struct stat st;
+	void *p = fstat(fd, &st) == 0 ? mmap(NULL, PIMAX_ANCHOR_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
+	                               : MAP_FAILED;
+	close(fd);
+	if (p == MAP_FAILED) {
+		U_LOG_E("PIMAX_ANCHOR: mmap failed");
+		unlink(tmp);
+		return false;
+	}
+	uint32_t hdr[4] = {PIMAX_ANCHOR_MAGIC, 1, 0, (uint32_t)getpid()};
+	memcpy(p, hdr, sizeof(hdr));
+	if (rename(tmp, s->ring_path) != 0) {
+		U_LOG_E("PIMAX_ANCHOR: cannot rename %s to %s", tmp, s->ring_path);
+		munmap(p, PIMAX_ANCHOR_SIZE);
+		unlink(tmp);
+		return false;
+	}
+	if (s->ring != NULL) {
+		munmap(s->ring, PIMAX_ANCHOR_SIZE);
+	}
+	s->ring = (uint8_t *)p;
+	s->ring_dev = st.st_dev;
+	s->ring_ino = st.st_ino;
+	s->next = 0;
+	s->last_ring_ns = 0;
+	return true;
+}
+
 //! Call with the lock held.
 static inline void
 pimax_anchor_init_locked(struct pimax_anchor_state *s)
@@ -98,35 +204,58 @@ pimax_anchor_init_locked(struct pimax_anchor_state *s)
 		return;
 	}
 	pimax_anchor_path("PIMAX_ANCHOR_FILE", "pimax-anchor.offset", s->offset_path, sizeof(s->offset_path));
+	pimax_anchor_path("PIMAX_ANCHOR_HEAD_FILE", "pimax-anchor.head", s->ring_path, sizeof(s->ring_path));
+	uint32_t owner = pimax_anchor_live_owner(s->ring_path);
+	if (owner != 0) {
+		// another process (the session's monado-service) owns the room anchor: its ring and offset stay
+		U_LOG_W("PIMAX_ANCHOR: pid %u (running) owns the room anchor %s; this process (pid %d) leaves it and the "
+		        "offset alone: room anchor off here",
+		        owner, s->ring_path, (int)getpid());
+		return;
+	}
 	unlink(s->offset_path);
-	char ring_path[512];
-	pimax_anchor_path("PIMAX_ANCHOR_HEAD_FILE", "pimax-anchor.head", ring_path, sizeof(ring_path));
-	unlink(ring_path);
-	int fd = open(ring_path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-	if (fd < 0 || ftruncate(fd, PIMAX_ANCHOR_SIZE) != 0) {
-		U_LOG_E("PIMAX_ANCHOR: cannot create %s", ring_path);
-		if (fd >= 0) {
-			close(fd);
-		}
+	if (!pimax_anchor_create_ring_locked(s)) {
 		return;
 	}
-	void *p = mmap(NULL, PIMAX_ANCHOR_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-	close(fd);
-	if (p == MAP_FAILED) {
-		U_LOG_E("PIMAX_ANCHOR: mmap failed");
-		return;
-	}
-	s->ring = (uint8_t *)p;
 	const char *e = getenv("PIMAX_ANCHOR_SLEW");
 	s->slew_m_s = (e != NULL && e[0] != '\0') ? (float)atof(e) : 0.05f;
 	e = getenv("PIMAX_ANCHOR_SLEW_DEG");
 	s->slew_deg_s = (e != NULL && e[0] != '\0') ? (float)atof(e) : 2.0f;
 	e = getenv("PIMAX_ANCHOR_SNAP");
 	s->snap_m = (e != NULL && e[0] != '\0') ? (float)atof(e) : 0.25f;
-	uint32_t hdr[4] = {PIMAX_ANCHOR_MAGIC, 1, 0, (uint32_t)getpid()};
-	memcpy(s->ring, hdr, sizeof(hdr));
 	s->enabled = true;
-	U_LOG_I("PIMAX_ANCHOR=1: head ring %s, offset file %s", ring_path, s->offset_path);
+	U_LOG_I("PIMAX_ANCHOR=1 (PIMAX_ANCHOR_OWNER): head ring %s, offset file %s", s->ring_path, s->offset_path);
+}
+
+/*!
+ * Once a second: is the path still our ring? Take it back when it was replaced or removed and no other live
+ * process keeps it fresh. Call with the lock held.
+ */
+static inline void
+pimax_anchor_keep_ring_locked(struct pimax_anchor_state *s, int64_t now_ns)
+{
+	if (now_ns - s->last_ring_check_ns < 1000LL * 1000 * 1000) {
+		return;
+	}
+	s->last_ring_check_ns = now_ns;
+	struct stat st;
+	if (stat(s->ring_path, &st) == 0 && st.st_dev == s->ring_dev && st.st_ino == s->ring_ino) {
+		return;
+	}
+	uint32_t owner = pimax_anchor_live_owner(s->ring_path);
+	if (owner != 0) {
+		if (owner != s->foreign_pid) {
+			U_LOG_W("PIMAX_ANCHOR: pid %u replaced the head ring %s and writes it; taking it back when it stops",
+			        owner, s->ring_path);
+			s->foreign_pid = owner;
+		}
+		return;
+	}
+	if (pimax_anchor_create_ring_locked(s)) {
+		U_LOG_W("PIMAX_ANCHOR: head ring %s was replaced or removed%s: publishing again (pid %d)", s->ring_path,
+		        s->foreign_pid != 0 ? " (its other writer stopped)" : "", (int)getpid());
+		s->foreign_pid = 0;
+	}
 }
 
 static inline void
@@ -268,10 +397,11 @@ pimax_anchor_process_ex(int64_t at_ns, struct xrt_space_relation *rel, bool reco
 		pthread_mutex_unlock(&s->lock);
 		return;
 	}
+	int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	pimax_anchor_keep_ring_locked(s, now_ns);
 	if (record) {
 		pimax_anchor_record_locked(s, at_ns, rel);
 	}
-	int64_t now_ns = (int64_t)os_monotonic_get_ns();
 	pimax_anchor_refresh_offset_locked(s, now_ns);
 	bool have = s->have_offset;
 	if (have) {
