@@ -15,11 +15,15 @@
  *  - `pimax-anchor apply` writes the offset file ("pimax-anchor-offset 1", "pid N", "pose px py pz qx qy qz qw");
  *    it is re-read when it changes (checked every 250 ms) and applied as app_from_slam = offset * slam to the head
  *    pose, so controllers, hands-in-head-frame and the gaze ray move with it. Ignored unless pid is this process.
- *  - small changes of the offset glide instead of jumping (the floor lock and periodic re-fixes write small steps):
- *    the applied offset moves toward the file's at most PIMAX_ANCHOR_SLEW m/s (default 0.05) and
- *    PIMAX_ANCHOR_SLEW_DEG deg/s (default 2), i.e. under 1 mm / 0.03 deg per 90 Hz frame. A change larger than
- *    PIMAX_ANCHOR_SNAP m (default 0.25) or 5 deg, and the first offset of a session, is applied at once (a deliberate
- *    placement). PIMAX_ANCHOR_SLEW=0 applies every change at once (the old behaviour).
+ *  - changes of the offset glide instead of jumping (PIMAX_ANCHOR_GLIDE, omarchyvr tracking plan phase 1b; live
+ *    failure 2026-10-17: a second offset writer moved the world 32 cm, above the old 0.25 m snap limit, and the
+ *    floor jumped): only the first offset of a session is placed at once (the room put in place at the start).
+ *    After that every change, however large, glides: the applied offset moves toward the file's at
+ *    PIMAX_ANCHOR_SLEW m/s (default 0.05) and PIMAX_ANCHOR_SLEW_DEG deg/s (default 2), i.e. under 1 mm / 0.03 deg
+ *    per 90 Hz frame, raised up to 3x (15 cm/s, 6 deg/s) while the head turns faster than 60 deg/s (a change hides
+ *    best in head motion). Each glide logs one "PIMAX_ANCHOR_GLIDE" line (size, expected duration).
+ *    Kill switch: PIMAX_ANCHOR_GLIDE=0 brings back the old rule (a change larger than PIMAX_ANCHOR_SNAP m, default
+ *    0.25, or 5 deg is applied at once). PIMAX_ANCHOR_SLEW=0 applies every change at once.
  *  - one owner per session (live failure 2026-10-16: a room setup panel started SteamVR, whose Monado driver opened
  *    the headset inside vrserver, deleted the offset file, recreated the ring with its own pid and exited; the real
  *    monado-service kept writing into the unlinked file, so readers saw a dead pid and no poses):
@@ -86,6 +90,9 @@ struct pimax_anchor_state
 	float slew_m_s;
 	float slew_deg_s;
 	float snap_m;
+	bool glide;          //!< PIMAX_ANCHOR_GLIDE (default on): no snap after the first placement
+	bool placed;         //!< the first offset of this session was placed
+	float head_dps;      //!< head turn rate (deg/s) of the latest compositor query
 };
 
 static struct pimax_anchor_state g_pimax_anchor = {.lock = PTHREAD_MUTEX_INITIALIZER};
@@ -223,8 +230,13 @@ pimax_anchor_init_locked(struct pimax_anchor_state *s)
 	s->slew_deg_s = (e != NULL && e[0] != '\0') ? (float)atof(e) : 2.0f;
 	e = getenv("PIMAX_ANCHOR_SNAP");
 	s->snap_m = (e != NULL && e[0] != '\0') ? (float)atof(e) : 0.25f;
+	e = getenv("PIMAX_ANCHOR_GLIDE");
+	s->glide = !(e != NULL && strcmp(e, "0") == 0);
 	s->enabled = true;
 	U_LOG_I("PIMAX_ANCHOR=1 (PIMAX_ANCHOR_OWNER): head ring %s, offset file %s", s->ring_path, s->offset_path);
+	U_LOG_I("PIMAX_ANCHOR_GLIDE=%d: %s (%.2f m/s, %.1f deg/s, up to 3x while the head turns)", s->glide ? 1 : 0,
+	        s->glide ? "every change after the first placement glides" : "changes above the snap limit are placed at once",
+	        s->slew_m_s, s->slew_deg_s);
 }
 
 /*!
@@ -258,6 +270,14 @@ pimax_anchor_keep_ring_locked(struct pimax_anchor_state *s, int64_t now_ns)
 	}
 }
 
+//! Angle between two unit quaternions (rad).
+static inline float
+pimax_anchor_quat_angle(const struct xrt_quat *a, const struct xrt_quat *b)
+{
+	float d = fabsf(a->x * b->x + a->y * b->y + a->z * b->z + a->w * b->w);
+	return 2.0f * acosf(d > 1.0f ? 1.0f : d);
+}
+
 static inline void
 pimax_anchor_refresh_offset_locked(struct pimax_anchor_state *s, int64_t now_ns)
 {
@@ -270,6 +290,11 @@ pimax_anchor_refresh_offset_locked(struct pimax_anchor_state *s, int64_t now_ns)
 		s->have_offset = false;
 		s->have_applied = false;
 		s->mtime_s = 0;
+		if (s->placed) {
+			// cleared (Room page): the world is the raw tracker world now; a later offset glides from there
+			s->applied = (struct xrt_pose)XRT_POSE_IDENTITY;
+			s->have_applied = s->glide;
+		}
 		return;
 	}
 	if (s->have_offset && st.st_mtim.tv_sec == s->mtime_s && st.st_mtim.tv_nsec == s->mtime_ns) {
@@ -292,6 +317,10 @@ pimax_anchor_refresh_offset_locked(struct pimax_anchor_state *s, int64_t now_ns)
 	if (!ok || pid != (unsigned)getpid()) {
 		s->have_offset = false;
 		s->have_applied = false;
+		if (s->placed) {
+			s->applied = (struct xrt_pose)XRT_POSE_IDENTITY;
+			s->have_applied = s->glide;
+		}
 		return;
 	}
 	s->offset.position = (struct xrt_vec3){v[0], v[1], v[2]};
@@ -300,6 +329,17 @@ pimax_anchor_refresh_offset_locked(struct pimax_anchor_state *s, int64_t now_ns)
 	s->have_offset = true;
 	U_LOG_I("PIMAX_ANCHOR: offset (%.3f %.3f %.3f) quat (%.3f %.3f %.3f %.3f)", v[0], v[1], v[2], v[3], v[4], v[5],
 	        v[6]);
+	if (s->glide && s->have_applied && s->slew_m_s > 0.0f) {
+		float dist = m_vec3_len(m_vec3_sub(s->offset.position, s->applied.position));
+		float ang = pimax_anchor_quat_angle(&s->applied.orientation, &s->offset.orientation) * 180.0f / (float)M_PI;
+		if (dist > 0.02f || ang > 1.0f) {
+			float t_m = dist / s->slew_m_s;
+			float t_a = s->slew_deg_s > 0.0f ? ang / s->slew_deg_s : 0.0f;
+			U_LOG_I("PIMAX_ANCHOR_GLIDE: gliding %.3f m, %.2f deg to the new offset (about %.1f s, faster while the "
+			        "head turns)",
+			        dist, ang, t_m > t_a ? t_m : t_a);
+		}
+	}
 }
 
 static inline void
@@ -328,14 +368,6 @@ pimax_anchor_record_locked(struct pimax_anchor_state *s, int64_t at_ns, const st
 	atomic_store_explicit(seq, q0 + 2, memory_order_release);
 }
 
-//! Angle between two unit quaternions (rad).
-static inline float
-pimax_anchor_quat_angle(const struct xrt_quat *a, const struct xrt_quat *b)
-{
-	float d = fabsf(a->x * b->x + a->y * b->y + a->z * b->z + a->w * b->w);
-	return 2.0f * acosf(d > 1.0f ? 1.0f : d);
-}
-
 /*!
  * Move the applied offset toward the file's (call with the lock held): glide small changes, snap big ones.
  */
@@ -355,21 +387,31 @@ pimax_anchor_step_locked(struct pimax_anchor_state *s, int64_t now_ns)
 	struct xrt_vec3 dp = m_vec3_sub(t->position, a->position);
 	float dist = m_vec3_len(dp);
 	float ang = pimax_anchor_quat_angle(&a->orientation, &t->orientation);
-	if (!s->have_applied || s->slew_m_s <= 0.0f || dist > s->snap_m || ang > 5.0f * (float)M_PI / 180.0f) {
+	bool snap_big = !s->glide && (dist > s->snap_m || ang > 5.0f * (float)M_PI / 180.0f);
+	if (!s->have_applied || s->slew_m_s <= 0.0f || snap_big) {
 		if (s->have_applied && (dist > 0.002f || ang > 0.001f)) {
 			U_LOG_I("PIMAX_ANCHOR: offset placed at once (%.3f m, %.2f deg)", dist, ang * 180.0f / (float)M_PI);
+		} else if (!s->placed) {
+			U_LOG_I("PIMAX_ANCHOR: first offset of the session placed at once");
 		}
 		*a = *t;
 		s->have_applied = true;
+		s->placed = true;
 		return;
 	}
-	float max_d = s->slew_m_s * dt;
+	// faster while the head turns: 1x up to 20 deg/s, 3x from 60 deg/s
+	float boost = 1.0f;
+	if (s->glide) {
+		float f = (s->head_dps - 20.0f) / 40.0f;
+		boost = 1.0f + 2.0f * (f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f));
+	}
+	float max_d = s->slew_m_s * boost * dt;
 	if (dist <= max_d) {
 		a->position = t->position;
 	} else {
 		a->position = m_vec3_add(a->position, m_vec3_mul_scalar(dp, max_d / dist));
 	}
-	float max_a = s->slew_deg_s * (float)M_PI / 180.0f * dt;
+	float max_a = s->slew_deg_s * boost * (float)M_PI / 180.0f * dt;
 	if (ang <= max_a || ang < 1e-6f) {
 		a->orientation = t->orientation;
 	} else {
@@ -401,6 +443,9 @@ pimax_anchor_process_ex(int64_t at_ns, struct xrt_space_relation *rel, bool reco
 	pimax_anchor_keep_ring_locked(s, now_ns);
 	if (record) {
 		pimax_anchor_record_locked(s, at_ns, rel);
+		if (rel->relation_flags & XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT) {
+			s->head_dps = m_vec3_len(rel->angular_velocity) * 180.0f / (float)M_PI;
+		}
 	}
 	pimax_anchor_refresh_offset_locked(s, now_ns);
 	bool have = s->have_offset;
