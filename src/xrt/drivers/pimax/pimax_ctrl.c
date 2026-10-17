@@ -26,6 +26,9 @@
  * lying on the desk. always (the driver's default, games) = as before; off = never shown. `pimax desk` passes auto.
  * Run-time change: $XDG_RUNTIME_DIR/pimax-ctrl-inhand-mode; status: $XDG_RUNTIME_DIR/pimax-ctrl-inhand.
  *
+ * Controller angle (PIMAX_CTRL_ANGLE, degrees -20..+70, default +30; live file $XDG_RUNTIME_DIR/pimax-ctrl-angle): grip and
+ * aim of both controllers are pitched up by this much about their own x axis (docs/CONTROLLERS.md).
+ *
  * Hand tracking (XR_EXT_hand_tracking, data source CONTROLLER): the finger curls come from the Rust crate pimax-hands
  * (trigger -> index, grip -> middle/ring/little, touch bits -> thumb; filters + thumb state machine live there), this
  * file only feeds it the decoded reports and runs Monado's u_hand_sim_simulate_generic on the result. The hand is
@@ -77,6 +80,11 @@ DEBUG_GET_ONCE_BOOL_OPTION(pimax_ctrl_hands, "PIMAX_CTRL_HANDS", true)
 DEBUG_GET_ONCE_BOOL_OPTION(pimax_ctrl_hands_demo, "PIMAX_CTRL_HANDS_DEMO", false)
 DEBUG_GET_ONCE_OPTION(pimax_ctrl_hands_feed, "PIMAX_CTRL_HANDS_FEED", "lazy")
 DEBUG_GET_ONCE_BOOL_OPTION(pimax_ctrl_track, "PIMAX_CTRL_TRACK", false)
+// PIMAX_CTRL_ANGLE: the controller angle in degrees, -20..+70, default +30 (docs/CONTROLLERS.md)
+DEBUG_GET_ONCE_FLOAT_OPTION(pimax_ctrl_angle, "PIMAX_CTRL_ANGLE", 30.0f)
+
+#define CTRL_ANGLE_MIN_DEG (-20.0f)
+#define CTRL_ANGLE_MAX_DEG (70.0f)
 
 #define ACTIVE_TIMEOUT_NS (1500ull * 1000 * 1000) // no report for this long -> inputs inactive
 #define REATTACH_MIN_NS (2500ull * 1000 * 1000)
@@ -141,6 +149,10 @@ struct pimax_ctrl_ctx
 
 	// In hand (PIMAX_CTRL_INHAND): PIMAX_INHAND_MODE_*, changed at run time by the attach thread.
 	atomic_int inhand_mode;
+
+	// PIMAX_CTRL_ANGLE: pitch (centi-degrees) added to the grip AND aim pose of both controllers; positive = the
+	// pointer tilts up. Start value from the env, live changes from $XDG_RUNTIME_DIR/pimax-ctrl-angle.
+	atomic_int angle_cdeg;
 };
 
 struct pimax_controller
@@ -569,6 +581,37 @@ optical_pose(struct pimax_controller *c, int64_t at_ns, enum xrt_input_name name
 	return true;
 }
 
+//! PIMAX_CTRL_ANGLE: clamp to the allowed range (NaN -> default 30).
+static float
+ctrl_angle_clamp(float deg)
+{
+	if (!(deg == deg)) {
+		return 30.0f;
+	}
+	return deg < CTRL_ANGLE_MIN_DEG ? CTRL_ANGLE_MIN_DEG : (deg > CTRL_ANGLE_MAX_DEG ? CTRL_ANGLE_MAX_DEG : deg);
+}
+
+/*!
+ * PIMAX_CTRL_ANGLE: pitch the pose about its own lateral (+X) axis. In OpenXR space the pointing ray is -Z and a
+ * positive rotation about +X turns -Z towards +Y (up), so +30 raises the pointer 30 deg for grip and aim alike (the
+ * grip is rigidly attached to the aim, so the SteamVR / xrizer aim derived from the grip moves with it). The position
+ * stays. Left and right hands use the same sign.
+ */
+static void
+apply_ctrl_angle(struct pimax_ctrl_ctx *ctx, struct xrt_pose *pose)
+{
+	int cdeg = atomic_load(&ctx->angle_cdeg);
+	if (cdeg == 0) {
+		return;
+	}
+	struct xrt_vec3 x = {1.0f, 0.0f, 0.0f};
+	struct xrt_quat q, out;
+	math_quat_from_angle_vector((float)cdeg * 0.01f * (float)(M_PI / 180.0), &x, &q);
+	math_quat_rotate(&pose->orientation, &q, &out);
+	math_quat_normalize(&out);
+	pose->orientation = out;
+}
+
 static xrt_result_t
 pimax_ctl_get_tracked_pose(struct xrt_device *xdev,
                            enum xrt_input_name name,
@@ -588,6 +631,7 @@ pimax_ctl_get_tracked_pose(struct xrt_device *xdev,
 	}
 
 	if (c->ctx->track && optical_pose(c, at_timestamp_ns, name, out_relation)) {
+		apply_ctrl_angle(c->ctx, &out_relation->pose);
 		return XRT_SUCCESS;
 	}
 
@@ -623,6 +667,7 @@ pimax_ctl_get_tracked_pose(struct xrt_device *xdev,
 		pthread_mutex_unlock(&c->lock);
 	}
 
+	apply_ctrl_angle(c->ctx, &pose);
 	struct xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
 	rel.pose = pose;
 	// Position is a fixed guess, not tracked: valid but not "tracked".
@@ -952,6 +997,26 @@ attach_thread(void *arg)
 			U_LOG_IFL_I(ctx->log_level, "PIMAX_CTRL_INHAND: controllers %s (run-time change)",
 			            pimax_inhand_mode_name(req));
 		}
+		// PIMAX_CTRL_ANGLE: live change from the app / CLI ($XDG_RUNTIME_DIR/pimax-ctrl-angle holds the degrees)
+		{
+			const char *rt = getenv("XDG_RUNTIME_DIR");
+			if (rt != NULL && rt[0] != '\0') {
+				char path[256];
+				snprintf(path, sizeof(path), "%s/pimax-ctrl-angle", rt);
+				FILE *af = fopen(path, "r");
+				if (af != NULL) {
+					float deg = 0.0f;
+					int ok = fscanf(af, "%f", &deg) == 1;
+					fclose(af);
+					int cd = (int)lroundf(ctrl_angle_clamp(deg) * 100.0f);
+					if (ok && cd != atomic_load(&ctx->angle_cdeg)) {
+						atomic_store(&ctx->angle_cdeg, cd);
+						U_LOG_IFL_I(ctx->log_level, "PIMAX_CTRL_ANGLE: controller angle %+.1f deg (run-time change)",
+						            (double)cd / 100.0);
+					}
+				}
+			}
+		}
 		for (int i = 0; i < 2; i++) {
 			struct pimax_controller *c = ctx->ctl[i];
 			if (c == NULL) {
@@ -1156,6 +1221,11 @@ pimax_ctrl_create(struct xrt_device *head, enum u_logging_level log_level, struc
 	// in hand: always unless PIMAX_CTRL_INHAND says otherwise (`pimax desk` passes auto, games keep always)
 	atomic_store(&ctx->inhand_mode, pimax_inhand_mode_from_env(PIMAX_INHAND_MODE_ALWAYS));
 	pimax_inhand_clear_request();
+	atomic_store(&ctx->angle_cdeg, (int)lroundf(ctrl_angle_clamp(debug_get_float_option_pimax_ctrl_angle()) * 100.0f));
+	U_LOG_IFL_I(log_level,
+	            "Pimax controllers: PIMAX_CTRL_ANGLE=%+.1f deg (pointer tilted up by this much; -20..+70, live file "
+	            "$XDG_RUNTIME_DIR/pimax-ctrl-angle)",
+	            (double)atomic_load(&ctx->angle_cdeg) / 100.0);
 	U_LOG_IFL_I(log_level,
 	            "Pimax controllers: PIMAX_CTRL_INHAND=%s (auto: shown only while in the hand; 5 s still or no reports "
 	            "for 1.5 s = put down, motion > 3.7 deg/s for 120 ms, a tilt or an input = picked up)",
