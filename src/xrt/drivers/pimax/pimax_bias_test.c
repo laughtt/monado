@@ -66,7 +66,7 @@ run_synth(struct pimax_bias_state *st,
 		enum pimax_bias_result res = pimax_bias_feed(st, r, g, a, og, oa);
 		if (res != PIMAX_BIAS_MORE) {
 			last = res;
-			if (res == PIMAX_BIAS_ACCEPT) {
+			if (res == PIMAX_BIAS_ACCEPT || res == PIMAX_BIAS_PROVISIONAL) {
 				memcpy(out, og, sizeof(og));
 			}
 		}
@@ -89,8 +89,37 @@ synthetic(void)
 	struct pimax_bias_state worn = {0};
 	CHECK(run_synth(&worn, &r, bias, 0.5, 0.005, 2.1, out) == PIMAX_BIAS_NOT_REST, "a worn head (0.5 deg/s) is not");
 	struct pimax_bias_state jiggle = {0};
+	pimax_bias_set_prev(&jiggle, bias);
 	CHECK(run_synth(&jiggle, &r, bias, 0.06, 0.006, 2.1, out) == PIMAX_BIAS_NOT_REST,
 	      "a quiet gyro with a shaking accelerometer is not");
+
+	// No bias at all (fresh machine, no cache): the first window quiet under the looser rule is provisional (used,
+	// never cached); later loose windows are not; the next real rest replaces it without a "near" check and is the
+	// first value that may be cached.
+	struct pimax_bias_state fresh = {0};
+	const float off[3] = {0.25f, 0.95f, 0.20f}; // a provisional mean off the true bias (a handled headset)
+	CHECK(run_synth(&fresh, &r, off, 0.25, 0.005, 2.1, out) == PIMAX_BIAS_PROVISIONAL,
+	      "no bias yet: a loose window (0.25 deg/s, 0.05 m/s^2) is provisional");
+	CHECK(fabsf(out[1] - 0.95f) < 0.03f && fresh.have_prev && fresh.prev_provisional, "provisional mean %.3f", out[1]);
+	CHECK(run_synth(&fresh, &r, off, 0.25, 0.005, 2.0, out) == PIMAX_BIAS_NOT_REST,
+	      "a second loose window is not a rest (only the first is provisional)");
+	CHECK(run_synth(&fresh, &r, bias, 0.06, 0.0013, 2.0, out) == PIMAX_BIAS_ACCEPT,
+	      "a real rest after a provisional bias is accepted at once (cached)");
+	CHECK(fabsf(out[1] - 0.775f) < 0.01f && !fresh.prev_provisional, "real rest mean %.3f", out[1]);
+	struct pimax_bias_state cached = {0};
+	pimax_bias_set_prev(&cached, bias);
+	CHECK(run_synth(&cached, &r, bias, 0.25, 0.005, 2.1, out) == PIMAX_BIAS_NOT_REST,
+	      "with a bias in use a loose window is never provisional");
+	struct pimax_bias_state noisy = {0};
+	CHECK(run_synth(&noisy, &r, bias, 0.06, 0.008, 2.1, out) == PIMAX_BIAS_NOT_REST,
+	      "accel sd 0.08 m/s^2 is not even provisional");
+	// The 11:59:47 worn window (head tilted 23 deg, gyro sd 0.5 deg/s, mean 0.185 0.892 0.418): with no bias it is
+	// not even provisional, so it can never reach the cache.
+	struct pimax_bias_state worn1159 = {0};
+	const float worn_mean[3] = {0.185f, 0.892f, 0.418f};
+	enum pimax_bias_result w = run_synth(&worn1159, &r, worn_mean, 0.5, 0.004, 2.1, out);
+	CHECK(w != PIMAX_BIAS_ACCEPT && w != PIMAX_BIAS_PROVISIONAL && !worn1159.have_prev,
+	      "the 11:59:47 worn window was used (%s)", pimax_bias_result_str(w));
 
 	// Far from the bias in use: needs a second window that agrees.
 	struct pimax_bias_state far = {0};
@@ -124,7 +153,7 @@ replay(int argc, char **argv)
 		pimax_bias_set_prev(&sn, p);
 	}
 	char line[256];
-	int new_acc_worn = 0, new_acc_desk = 0, old_acc_worn = 0, rejected[6] = {0};
+	int new_acc_worn = 0, new_acc_desk = 0, old_acc_worn = 0, rejected[7] = {0}, prov_worn = 0;
 	float desk_mean[3] = {0};
 	while (fgets(line, sizeof(line), f) != NULL) {
 		long long ts;
@@ -141,6 +170,9 @@ replay(int argc, char **argv)
 		enum pimax_bias_result rn = pimax_bias_feed(&sn, &rule, g, a, og, oa);
 		if (rn != PIMAX_BIAS_MORE && rn != PIMAX_BIAS_MOVING) {
 			rejected[rn]++;
+			if (rn == PIMAX_BIAS_PROVISIONAL && t < t_worn) {
+				prov_worn++;
+			}
 			if (rn == PIMAX_BIAS_ACCEPT) {
 				if (t < t_worn) {
 					new_acc_worn++;
@@ -167,10 +199,13 @@ replay(int argc, char **argv)
 	}
 	fclose(f);
 	printf("new rule: %d windows accepted while worn, %d on the desk (last %+.3f %+.3f %+.3f dps); rejected: %d not "
-	       "a rest, %d drifting, %d far; old rule: %d accepted while worn\n",
+	       "a rest, %d drifting, %d far, %d provisional (%d while worn, never cached); old rule: %d accepted while "
+	       "worn\n",
 	       new_acc_worn, new_acc_desk, desk_mean[0], desk_mean[1], desk_mean[2], rejected[PIMAX_BIAS_NOT_REST],
-	       rejected[PIMAX_BIAS_DRIFTING], rejected[PIMAX_BIAS_FAR], old_acc_worn);
-	CHECK(new_acc_worn == 0, "a worn window was accepted");
+	       rejected[PIMAX_BIAS_DRIFTING], rejected[PIMAX_BIAS_FAR], rejected[PIMAX_BIAS_PROVISIONAL], prov_worn,
+	       old_acc_worn);
+	CHECK(new_acc_worn == 0, "a worn window was accepted (cached)");
+	CHECK(rejected[PIMAX_BIAS_PROVISIONAL] <= 1, "more than one provisional window");
 	CHECK(new_acc_desk > 0, "the desk rest was not accepted");
 	CHECK(old_acc_worn > 0, "the old rule should have taken a worn window (the 11:59:47 bug)");
 	return failures ? 1 : 0;

@@ -11,7 +11,8 @@
  * with the bias cached by the last good calibration (~/.cache/omarchyvr/gyro-bias, old ~/.cache/pimax, else zero) and the window keeps
  * running: every later window that is a REAL rest (pimax_bias.h: every axis as quiet as the bare sensor on a desk, and
  * the mean near the bias in use) refines the bias for the whole session and is cached; a worn head never qualifies
- * (2026-10-18: a worn window had been cached as the bias).
+ * (2026-10-18: a worn window had been cached as the bias). With no bias at all (no cache), the first window that is
+ * quiet under a looser rule is used as a provisional bias (never cached) until a real rest replaces it.
  *
  * @ingroup drv_pimax
  */
@@ -390,9 +391,26 @@ bias_timeout(struct pimax_hmd *hmd, const float accel_g[3])
 	bias_restart(hmd);
 	HMD_WARN(hmd,
 	         "headset not still for %u ms (%u restarts): tracking with the %s gyro bias %.3f %.3f %.3f dps; "
-	         "it is refined every time the headset rests for %u ms",
+	         "it is refined every time the headset rests for %u ms%s",
 	         hmd->timeout_n, hmd->bias.restarts, cached ? "cached" : "zero (no cache)", g[0], g[1], g[2],
-	         hmd->bias_target);
+	         hmd->bias_target, cached ? "" : " (put the headset still on the desk for 2 s to calibrate the gyro)");
+}
+
+//! No bias yet (no cache) and a window quiet enough for a provisional one: use it (never cached); a real rest
+//! replaces it. The first time it also seeds the tilt and starts tracking.
+static void
+bias_provisional(struct pimax_hmd *hmd, const float g[3], const float a[3])
+{
+	bias_set(hmd, g);
+	const struct pimax_bias_state *b = &hmd->bias;
+	HMD_WARN(hmd,
+	         "gyro bias provisional: %.3f %.3f %.3f dps (gyro sd %.3f %.3f %.3f dps: not a real rest, not cached); "
+	         "put the headset still on the desk for 2 s to calibrate the gyro",
+	         g[0], g[1], g[2], b->last_gsd[0], b->last_gsd[1], b->last_gsd[2]);
+	if (!hmd->bias_done) {
+		seed_tilt(hmd, a);
+		hmd->bias_done = true;
+	}
 }
 
 //! Feed one sample into the rest window. Returns true when a window was accepted (bias_finish was called).
@@ -403,6 +421,10 @@ bias_feed(struct pimax_hmd *hmd, const pimax_imu_sample *s)
 	enum pimax_bias_result r = pimax_bias_feed(&hmd->bias, &hmd->bias_rule, s->gyro_dps, s->accel_g, g, a);
 	if (r == PIMAX_BIAS_ACCEPT) {
 		bias_finish(hmd, g, a);
+		return true;
+	}
+	if (r == PIMAX_BIAS_PROVISIONAL) {
+		bias_provisional(hmd, g, a);
 		return true;
 	}
 	if (r == PIMAX_BIAS_NOT_REST || r == PIMAX_BIAS_FAR || r == PIMAX_BIAS_DRIFTING) {

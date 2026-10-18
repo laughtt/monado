@@ -14,6 +14,12 @@
  * and 0.009-0.017 m/s^2), so a window is a rest only when every axis is that quiet, and its mean must be near the
  * bias in use (a slow steady turn is quiet too) unless two windows in a row agree on a new value.
  *
+ * Provisional bias (2026-10-18, release review): with NO bias at all (no cache: a fresh machine), a noisier IMU or a
+ * user who never rests the headset would keep a zero bias all session. So while there is no bias in use, the first
+ * window under a looser rule (gyro sd < 0.3 deg/s, accel sd < 0.06 m/s^2 per axis, half means agreeing) is used as a
+ * PROVISIONAL bias: applied, never cached. The next strict window replaces it (no "near" check against a provisional
+ * value) and is cached as before. A worn window like 11:59:47 (sd 0.5 deg/s) is not even provisional.
+ *
  * @ingroup drv_pimax
  */
 
@@ -37,6 +43,8 @@ struct pimax_bias_rule
 	double accel_sd_max_g;  //!< ... and the per-axis accelerometer one below this
 	double mean_tol_dps;    //!< the mean must be within this of the bias in use (per axis) ...
 	double confirm_tol_dps; //!< ... unless the previous far window agreed with it within this (per axis)
+	double prov_gyro_sd_max_dps; //!< with no bias in use: the looser gyro sd for a provisional bias ...
+	double prov_accel_sd_max_g;  //!< ... and the looser accelerometer one
 };
 
 //! What a sample did.
@@ -48,6 +56,7 @@ enum pimax_bias_result
 	PIMAX_BIAS_DRIFTING = 3, //!< the two half means disagree
 	PIMAX_BIAS_NOT_REST = 4, //!< too much spread for a headset at rest (worn)
 	PIMAX_BIAS_FAR = 5,      //!< a rest, but far from the bias in use (kept to confirm)
+	PIMAX_BIAS_PROVISIONAL = 6, //!< no bias in use yet, a quiet-enough window: use it, do not cache it
 };
 
 //! Window state.
@@ -56,6 +65,7 @@ struct pimax_bias_state
 	uint32_t n;
 	double g[3], g2[3], a[3], a2[3], half[3];
 	bool have_prev; //!< `prev` = the bias in use (cache or an accepted window)
+	bool prev_provisional; //!< `prev` came from a provisional window (not a real rest)
 	float prev[3];
 	bool have_far; //!< `far` = the last rest window rejected as far
 	float far[3];
@@ -74,6 +84,8 @@ pimax_bias_rule_default(struct pimax_bias_rule *r, uint32_t target)
 	r->accel_sd_max_g = 0.03 / 9.80665;
 	r->mean_tol_dps = 0.3;
 	r->confirm_tol_dps = 0.05;
+	r->prov_gyro_sd_max_dps = 0.3;
+	r->prov_accel_sd_max_g = 0.06 / 9.80665;
 }
 
 static inline void
@@ -93,11 +105,13 @@ pimax_bias_set_prev(struct pimax_bias_state *s, const float g[3])
 		s->prev[i] = g[i];
 	}
 	s->have_prev = true;
+	s->prev_provisional = false;
 }
 
 /*!
  * One raw sample (deg/s, g). On PIMAX_BIAS_ACCEPT `out_g` / `out_a` get the window means (gyro deg/s, accel g)
- * and the value becomes the bias in use. Every completed window (accepted or not) starts a new one.
+ * and the value becomes the bias in use (cache it). On PIMAX_BIAS_PROVISIONAL the same, but it is not a real rest
+ * (use it, do not cache it). Every completed window (accepted or not) starts a new one.
  */
 static inline enum pimax_bias_result
 pimax_bias_feed(struct pimax_bias_state *s,
@@ -133,7 +147,7 @@ pimax_bias_feed(struct pimax_bias_state *s,
 	}
 	double n = s->n, h = r->target / 2;
 	double dmax = 0;
-	bool quiet = true;
+	bool quiet = true, loose = true;
 	for (int i = 0; i < 3; i++) {
 		double m = s->g[i] / n;
 		double ma = s->a[i] / n;
@@ -142,6 +156,7 @@ pimax_bias_feed(struct pimax_bias_state *s,
 		s->last_asd[i] = sqrt(fmax(0.0, s->a2[i] / n - ma * ma));
 		dmax = fmax(dmax, fabs(s->half[i] / h - (s->g[i] - s->half[i]) / (n - h)));
 		quiet = quiet && s->last_gsd[i] < r->gyro_sd_max_dps && s->last_asd[i] < r->accel_sd_max_g;
+		loose = loose && s->last_gsd[i] < r->prov_gyro_sd_max_dps && s->last_asd[i] < r->prov_accel_sd_max_g;
 		out_g[i] = (float)m;
 		out_a[i] = (float)ma;
 	}
@@ -151,11 +166,16 @@ pimax_bias_feed(struct pimax_bias_state *s,
 		return PIMAX_BIAS_DRIFTING;
 	}
 	if (!quiet) {
+		if (loose && !s->have_prev) {
+			pimax_bias_set_prev(s, out_g);
+			s->prev_provisional = true;
+			return PIMAX_BIAS_PROVISIONAL;
+		}
 		return PIMAX_BIAS_NOT_REST;
 	}
 	bool near = true, confirmed = s->have_far;
 	for (int i = 0; i < 3; i++) {
-		near = near && (!s->have_prev || fabs(out_g[i] - s->prev[i]) <= r->mean_tol_dps);
+		near = near && (!s->have_prev || s->prev_provisional || fabs(out_g[i] - s->prev[i]) <= r->mean_tol_dps);
 		confirmed = confirmed && fabs(out_g[i] - s->far[i]) <= r->confirm_tol_dps;
 	}
 	if (!near && !confirmed) {
@@ -180,6 +200,7 @@ pimax_bias_result_str(enum pimax_bias_result r)
 	case PIMAX_BIAS_DRIFTING: return "drifting";
 	case PIMAX_BIAS_NOT_REST: return "not a rest (worn or handled)";
 	case PIMAX_BIAS_FAR: return "far from the bias in use";
+	case PIMAX_BIAS_PROVISIONAL: return "provisional (no bias yet, not a real rest)";
 	}
 	return "?";
 }
