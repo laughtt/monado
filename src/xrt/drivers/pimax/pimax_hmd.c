@@ -9,7 +9,9 @@
  * see analysis/imu-orientation.md) and the initial tilt is seeded from the mean accelerometer.
  * If no still window comes within PIMAX_BIAS_TIMEOUT_MS (default 3000, e.g. started while worn), tracking starts
  * with the bias cached by the last good calibration (~/.cache/omarchyvr/gyro-bias, old ~/.cache/pimax, else zero) and the window keeps
- * running: every later still window replaces the bias.
+ * running: every later window that is a REAL rest (pimax_bias.h: every axis as quiet as the bare sensor on a desk, and
+ * the mean near the bias in use) refines the bias for the whole session and is cached; a worn head never qualifies
+ * (2026-10-18: a worn window had been cached as the bias).
  *
  * @ingroup drv_pimax
  */
@@ -42,6 +44,7 @@
 #include "pimax_camera.h"
 #include "pimax_eyeglue.h"
 #include "pimax_anchor.h"
+#include "pimax_bias.h"
 
 #include "os/os_threading.h"
 
@@ -100,17 +103,19 @@ struct pimax_hmd
 	int64_t clock_offset_ns;
 	uint64_t last_ts_ns;
 
-	// Startup bias estimation.
+	// Gyro bias: the startup window, then refined on every real rest (pimax_bias.h).
 	bool bias_done;
-	uint32_t bias_n;
 	uint32_t bias_target;
-	double gyro_sum[3];
-	double acc_sum[3];
-	double half_sum[3]; // sum over first half of the window
-	uint32_t restarts;
+	struct pimax_bias_rule bias_rule;
+	struct pimax_bias_state bias;
 	uint32_t total_n;   // samples since start, for the timeout
 	uint32_t timeout_n; // 1 kHz IMU: ms == samples
-	bool bias_fallback; // tracking started with the cached bias; still windows keep refining it
+	uint32_t bias_refines; // windows accepted after the start
+	uint32_t bias_rejects; // completed windows that were not a real rest
+	uint64_t bias_log_ns;  // last rejection / refinement log line
+	uint64_t bias_save_ns; // last cache write
+	float bias_saved[3];   // the value last written to the cache
+	bool bias_have_saved;
 
 	uint32_t count;
 	float bias_dps[3];
@@ -241,10 +246,7 @@ pimax_hmd_take_hand_devices(struct xrt_device *xdev, struct xrt_device *out[2])
 static void
 bias_restart(struct pimax_hmd *hmd)
 {
-	hmd->bias_n = 0;
-	for (int i = 0; i < 3; i++) {
-		hmd->gyro_sum[i] = hmd->acc_sum[i] = hmd->half_sum[i] = 0;
-	}
+	pimax_bias_restart(&hmd->bias);
 }
 
 //! The gyro bias cache: <cache>/omarchyvr/gyro-bias (the app's cache dir); `legacy` gives the old
@@ -329,28 +331,51 @@ seed_tilt(struct pimax_hmd *hmd, const float a[3])
 	math_quat_normalize(&hmd->fusion.rot);
 }
 
-//! A still window completed: first time it also seeds the tilt and starts tracking; later it only updates the bias.
+//! The cache gets a new value only when it moved (> 0.01 deg/s on an axis) or 5 minutes passed: a headset resting on
+//! the desk completes a window every 2 s.
 static void
-bias_finish(struct pimax_hmd *hmd)
+bias_maybe_save(struct pimax_hmd *hmd, const float g[3], uint64_t now)
 {
-	double n = hmd->bias_n;
-	float g[3], a[3];
+	float dmax = 0;
 	for (int i = 0; i < 3; i++) {
-		g[i] = (float)(hmd->gyro_sum[i] / n);
-		a[i] = (float)(hmd->acc_sum[i] / n);
+		dmax = fmaxf(dmax, fabsf(g[i] - hmd->bias_saved[i]));
+	}
+	if (hmd->bias_have_saved && dmax <= 0.01f && now - hmd->bias_save_ns < 300ULL * 1000000000ULL) {
+		return;
+	}
+	bias_cache_save(g);
+	memcpy(hmd->bias_saved, g, sizeof(hmd->bias_saved));
+	hmd->bias_have_saved = true;
+	hmd->bias_save_ns = now;
+}
+
+//! A real rest completed: the first time it also seeds the tilt and starts tracking; later it refines the bias.
+static void
+bias_finish(struct pimax_hmd *hmd, const float g[3], const float a[3])
+{
+	uint64_t now = os_monotonic_get_ns();
+	float dmax = 0;
+	for (int i = 0; i < 3; i++) {
+		dmax = fmaxf(dmax, fabsf(g[i] - hmd->bias_dps[i]));
 	}
 	bias_set(hmd, g);
-	bias_cache_save(g);
+	bias_maybe_save(hmd, g, now);
 
-	if (hmd->bias_fallback) {
-		hmd->bias_fallback = false;
-		HMD_INFO(hmd, "gyro bias refined while running: %.3f %.3f %.3f dps", g[0], g[1], g[2]);
+	if (hmd->bias_done) {
+		hmd->bias_refines++;
+		if (dmax > 0.02f || now - hmd->bias_log_ns > 60ULL * 1000000000ULL) {
+			hmd->bias_log_ns = now;
+			HMD_INFO(hmd,
+			         "gyro bias refined at rest: %.3f %.3f %.3f dps (moved %.3f; %u rests this session, %u windows "
+			         "rejected as not a real rest)",
+			         g[0], g[1], g[2], dmax, hmd->bias_refines, hmd->bias_rejects);
+		}
 		return;
 	}
 	seed_tilt(hmd, a);
 	hmd->bias_done = true;
 	HMD_INFO(hmd, "gyro bias done: %.3f %.3f %.3f dps over %u samples (%u restarts); accel %.3f %.3f %.3f g",
-	         g[0], g[1], g[2], hmd->bias_n, hmd->restarts, a[0], a[1], a[2]);
+	         g[0], g[1], g[2], hmd->bias_target, hmd->bias.restarts, a[0], a[1], a[2]);
 }
 
 //! No still window in time (headset worn at start): track now with the cached bias.
@@ -361,57 +386,41 @@ bias_timeout(struct pimax_hmd *hmd, const float accel_g[3])
 	bool cached = bias_cache_load(g);
 	bias_set(hmd, g);
 	seed_tilt(hmd, accel_g);
-	hmd->bias_fallback = true;
 	hmd->bias_done = true;
 	bias_restart(hmd);
 	HMD_WARN(hmd,
 	         "headset not still for %u ms (%u restarts): tracking with the %s gyro bias %.3f %.3f %.3f dps; "
-	         "it is refined the next time the headset rests for %u ms",
-	         hmd->timeout_n, hmd->restarts, cached ? "cached" : "zero (no cache)", g[0], g[1], g[2],
+	         "it is refined every time the headset rests for %u ms",
+	         hmd->timeout_n, hmd->bias.restarts, cached ? "cached" : "zero (no cache)", g[0], g[1], g[2],
 	         hmd->bias_target);
 }
 
-//! Feed one sample into the still window. Returns true when a window completed (bias_finish was called).
+//! Feed one sample into the rest window. Returns true when a window was accepted (bias_finish was called).
 static bool
 bias_feed(struct pimax_hmd *hmd, const pimax_imu_sample *s)
 {
-	// Reject the window when the headset is moving.
-	double gm = fabs(s->gyro_dps[0]) + fabs(s->gyro_dps[1]) + fabs(s->gyro_dps[2]);
-	if (gm > 8.0 + 3.0 * 1.0) { // bias itself is ~1 dps, so allow ~11 dps sum
-		if (hmd->bias_n > 0) {
-			hmd->restarts++;
+	float g[3], a[3];
+	enum pimax_bias_result r = pimax_bias_feed(&hmd->bias, &hmd->bias_rule, s->gyro_dps, s->accel_g, g, a);
+	if (r == PIMAX_BIAS_ACCEPT) {
+		bias_finish(hmd, g, a);
+		return true;
+	}
+	if (r == PIMAX_BIAS_NOT_REST || r == PIMAX_BIAS_FAR || r == PIMAX_BIAS_DRIFTING) {
+		hmd->bias_rejects++;
+		uint64_t now = os_monotonic_get_ns();
+		if (r != PIMAX_BIAS_DRIFTING && now - hmd->bias_log_ns > 60ULL * 1000000000ULL) {
+			hmd->bias_log_ns = now;
+			const struct pimax_bias_state *b = &hmd->bias;
+			HMD_INFO(hmd,
+			         "gyro bias window not used (%s): mean %.3f %.3f %.3f dps, gyro sd %.3f %.3f %.3f dps, accel sd "
+			         "%.4f %.4f %.4f m/s^2 (a rest needs < %.2f dps and < %.3f m/s^2); bias stays %.3f %.3f %.3f",
+			         pimax_bias_result_str(r), b->last_mean[0], b->last_mean[1], b->last_mean[2], b->last_gsd[0],
+			         b->last_gsd[1], b->last_gsd[2], b->last_asd[0] * 9.80665, b->last_asd[1] * 9.80665,
+			         b->last_asd[2] * 9.80665, hmd->bias_rule.gyro_sd_max_dps, hmd->bias_rule.accel_sd_max_g * 9.80665,
+			         hmd->bias_dps[0], hmd->bias_dps[1], hmd->bias_dps[2]);
 		}
-		bias_restart(hmd);
-		return false;
 	}
-	for (int i = 0; i < 3; i++) {
-		hmd->gyro_sum[i] += s->gyro_dps[i];
-		hmd->acc_sum[i] += s->accel_g[i];
-	}
-	hmd->bias_n++;
-	if (hmd->bias_n == hmd->bias_target / 2) {
-		for (int i = 0; i < 3; i++) {
-			hmd->half_sum[i] = hmd->gyro_sum[i];
-		}
-	}
-	if (hmd->bias_n < hmd->bias_target) {
-		return false;
-	}
-	// First half vs second half mean must agree (< 0.3 dps) else it was not still.
-	double h = hmd->bias_target / 2.0;
-	double dmax = 0;
-	for (int i = 0; i < 3; i++) {
-		double m1 = hmd->half_sum[i] / h;
-		double m2 = (hmd->gyro_sum[i] - hmd->half_sum[i]) / (hmd->bias_n - h);
-		dmax = fmax(dmax, fabs(m1 - m2));
-	}
-	if (dmax > 0.3) {
-		hmd->restarts++;
-		bias_restart(hmd);
-		return false;
-	}
-	bias_finish(hmd);
-	return true;
+	return false;
 }
 
 //! Runs on the libpimax session thread.
@@ -518,9 +527,8 @@ pimax_on_imu(void *user, const pimax_imu_sample *s)
 		}
 		return;
 	}
-	if (hmd->bias_fallback) {
-		bias_feed(hmd, s);
-	}
+	// Every later real rest refines the bias (not only the first one, and never a worn window).
+	bias_feed(hmd, s);
 
 	m_imu_3dof_update(&hmd->fusion, ts_ns, &accel, &gyro);
 
@@ -787,6 +795,14 @@ pimax_hmd_create(struct xrt_device *out_ctrls[2])
 	hmd->bias_target = (uint32_t)(bias_ms < 200 ? 200 : bias_ms); // 1 kHz IMU: ms == samples
 	long timeout_ms = debug_get_num_option_pimax_bias_timeout_ms();
 	hmd->timeout_n = (uint32_t)(timeout_ms < 200 ? 200 : timeout_ms);
+	pimax_bias_rule_default(&hmd->bias_rule, hmd->bias_target);
+	{
+		// Windows are compared with the cached bias from the start (a far one needs a second that agrees).
+		float cached[3];
+		if (bias_cache_load(cached)) {
+			pimax_bias_set_prev(&hmd->bias, cached);
+		}
+	}
 
 	hmd->base.update_inputs = pimax_hmd_update_inputs;
 	hmd->base.get_tracked_pose = pimax_hmd_get_tracked_pose;
